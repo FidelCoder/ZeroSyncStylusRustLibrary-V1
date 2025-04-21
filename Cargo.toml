@@ -1,0 +1,31 @@
+[package]
+name = "zerosync"
+version = "0.1.0"
+edition = "2021"
+authors = ["Your Name <your.email@example.com>"]
+description = "Zero-knowledge proof library optimized for Arbitrum Stylus"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+rand = "0.8"
+bitvec = "1.0"
+ark-ff = { version = "0.4", optional = true }
+ark-ec = { version = "0.4", optional = true }
+num-bigint = "0.4"
+num-traits = "0.2"
+thiserror = "1.0"
+rayon = { version = "1.7", optional = true }
+
+[dev-dependencies]
+criterion = "0.5"
+proptest = "1.2"
+
+[features]
+default = []
+parallel = ["rayon"]
+std = []
+bench-comparison = ["ark-ff", "ark-ec"]
+
+[[bench]]
+name = "field_ops"
+harness = false
