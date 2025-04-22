@@ -1,48 +1,78 @@
 #![cfg(feature = "simd")]
 #![cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 
+#[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 use crate::arithmetic::field::Fp;
 
-/// Performs 4-way parallel field multiplication using AVX2
-#[target_feature(enable = "avx2")]
-pub unsafe fn field_mul_avx2(a: &[u64; 4], b: &[u64; 4], modulus: &[u64; 4]) -> [u64; 4] {
+/// Returns true if AVX2 instructions are available
+#[inline]
+pub fn has_avx2() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        is_x86_feature_detected!("avx2")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
+/// Performs field multiplication using AVX2 instructions
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+pub unsafe fn field_mul_avx2(a: &[u64], b: &[u64], modulus: &[u64]) -> Vec<u64> {
+    assert_eq!(a.len(), 4);
+    assert_eq!(b.len(), 4);
+    assert_eq!(modulus.len(), 4);
+
+    let mut result = vec![0u64; 4];
+
+    // Load vectors
     let a_vec = _mm256_loadu_si256(a.as_ptr() as *const __m256i);
     let b_vec = _mm256_loadu_si256(b.as_ptr() as *const __m256i);
-    let modulus_vec = _mm256_loadu_si256(modulus.as_ptr() as *const __m256i);
+    let m_vec = _mm256_loadu_si256(modulus.as_ptr() as *const __m256i);
 
-    // Multiply using AVX2 instructions
-    let mut result = [0u64; 4];
-    let t = _mm256_mul_epu32(a_vec, b_vec);
-    
-    // Reduce modulo using Barrett reduction
-    let q = _mm256_srli_epi64(t, 64);
-    let r = _mm256_and_si256(t, _mm256_set1_epi64x(0xFFFFFFFFFFFFFFFF));
-    
-    let qm = _mm256_mul_epu32(q, modulus_vec);
-    let final_result = _mm256_sub_epi64(r, qm);
-    
-    _mm256_storeu_si256(result.as_mut_ptr() as *mut __m256i, final_result);
+    // Multiply and reduce modulo m
+    let mut temp = _mm256_mul_epu32(a_vec, b_vec);
+    temp = _mm256_rem_epu32(temp, m_vec);
+
+    // Store result
+    _mm256_storeu_si256(result.as_mut_ptr() as *mut __m256i, temp);
     result
 }
 
-/// Performs 4-way parallel field addition using AVX2
-#[target_feature(enable = "avx2")]
-pub unsafe fn field_add_avx2(a: &[u64; 4], b: &[u64; 4], modulus: &[u64; 4]) -> [u64; 4] {
+/// Performs field addition using AVX2 instructions
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+pub unsafe fn field_add_avx2(a: &[u64], b: &[u64], modulus: &[u64]) -> Vec<u64> {
+    assert_eq!(a.len(), 4);
+    assert_eq!(b.len(), 4);
+    assert_eq!(modulus.len(), 4);
+
+    let mut result = vec![0u64; 4];
+
+    // Load vectors
     let a_vec = _mm256_loadu_si256(a.as_ptr() as *const __m256i);
     let b_vec = _mm256_loadu_si256(b.as_ptr() as *const __m256i);
-    let modulus_vec = _mm256_loadu_si256(modulus.as_ptr() as *const __m256i);
+    let m_vec = _mm256_loadu_si256(modulus.as_ptr() as *const __m256i);
 
-    // Add using AVX2
-    let sum = _mm256_add_epi64(a_vec, b_vec);
-    
-    // Reduce if necessary
-    let mask = _mm256_cmpgt_epi64(sum, modulus_vec);
-    let reduced = _mm256_sub_epi64(sum, _mm256_and_si256(mask, modulus_vec));
-    
-    let mut result = [0u64; 4];
-    _mm256_storeu_si256(result.as_mut_ptr() as *mut __m256i, reduced);
+    // Add and reduce modulo m
+    let mut temp = _mm256_add_epi64(a_vec, b_vec);
+    temp = _mm256_rem_epu32(temp, m_vec);
+
+    // Store result
+    _mm256_storeu_si256(result.as_mut_ptr() as *mut __m256i, temp);
     result
+}
+
+// Fallback implementations for non-x86_64 or non-AVX2 platforms
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+pub fn field_mul_avx2(_a: &[u64], _b: &[u64], _modulus: &[u64]) -> Vec<u64> {
+    panic!("AVX2 not available");
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+pub fn field_add_avx2(_a: &[u64], _b: &[u64], _modulus: &[u64]) -> Vec<u64> {
+    panic!("AVX2 not available");
 }
 
 /// Performs 4-way parallel Montgomery reduction using AVX2
@@ -69,16 +99,6 @@ pub unsafe fn mont_reduce_avx2(t: &[u64; 8], modulus: &[u64; 4], n_prime: u64) -
     
     _mm256_storeu_si256(result.as_mut_ptr() as *mut __m256i, reduced);
     result
-}
-
-/// Runtime CPU feature detection
-pub fn has_avx2() -> bool {
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        std::is_x86_feature_detected!("avx2")
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    false
 }
 
 #[cfg(test)]

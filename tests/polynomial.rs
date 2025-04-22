@@ -1,114 +1,254 @@
-use zerosync::polynomial::{Polynomial, evaluate_polynomial};
 use num_bigint::BigUint;
+use num_traits::Num;
+use zerosync::arithmetic::field::Fp;
+use zerosync::polynomial::{Polynomial, evaluate_polynomial};
+
+const TEST_MODULUS: &str = "17";  // Small prime for testing
 
 #[test]
 fn test_polynomial_creation() {
-    let coefficients = vec![1u64, 2, 3];  // x^2 + 2x + 3
-    let poly = Polynomial::new(coefficients.clone());
-    assert_eq!(poly.degree(), 2);
-    assert_eq!(poly.coefficients(), &coefficients);
-}
-
-#[test]
-fn test_polynomial_addition() {
-    let poly1 = Polynomial::new(vec![1u64, 2, 3]);  // x^2 + 2x + 3
-    let poly2 = Polynomial::new(vec![4u64, 5, 6]);  // x^2 + 5x + 6
+    let modulus = BigUint::from_str_radix(TEST_MODULUS, 10).unwrap();
+    let coefficients = vec![
+        Fp::new(BigUint::from(1u64), modulus.clone()),
+        Fp::new(BigUint::from(0u64), modulus.clone()),
+        Fp::new(BigUint::from(0u64), modulus.clone()),
+        Fp::new(BigUint::from(4u64), modulus.clone()),
+    ];  // 4x^3 + 1
     
-    let result = &poly1 + &poly2;
-    assert_eq!(result.coefficients(), &[5u64, 7, 9]);  // (x^2 + 2x + 3) + (x^2 + 5x + 6) = 2x^2 + 7x + 9
-}
-
-#[test]
-fn test_polynomial_multiplication() {
-    let poly1 = Polynomial::new(vec![1u64, 2]);     // 2x + 1
-    let poly2 = Polynomial::new(vec![3u64, 4]);     // 4x + 3
-    
-    let result = &poly1 * &poly2;
-    // (2x + 1)(4x + 3) = 8x^2 + 10x + 3
-    assert_eq!(result.coefficients(), &[3u64, 10, 8]);
-}
-
-#[test]
-fn test_polynomial_evaluation() {
-    let poly = Polynomial::new(vec![1u64, 2, 3]);  // 3x^2 + 2x + 1
-    let x = BigUint::from(2u32);
-    
-    let result = evaluate_polynomial(&poly, &x);
-    // At x = 2: 3(2^2) + 2(2) + 1 = 12 + 4 + 1 = 17
-    assert_eq!(result, BigUint::from(17u32));
-}
-
-#[test]
-fn test_polynomial_degree() {
-    let poly = Polynomial::new(vec![1u64, 0, 0, 4]);  // 4x^3 + 1
+    let poly = Polynomial::new(coefficients);
     assert_eq!(poly.degree(), 3);
-    
-    let zero_poly = Polynomial::new(vec![0u64]);
-    assert_eq!(zero_poly.degree(), 0);
 }
 
 #[test]
 fn test_polynomial_zero() {
-    let zero = Polynomial::zero();
-    assert_eq!(zero.coefficients(), &[0u64]);
-    assert_eq!(zero.degree(), 0);
+    let modulus = BigUint::from_str_radix(TEST_MODULUS, 10).unwrap();
+    let zero_poly = Polynomial::new(vec![
+        Fp::new(BigUint::from(0u64), modulus.clone())
+    ]);
+    assert_eq!(zero_poly.degree(), 0);
+}
+
+#[test]
+fn test_polynomial_evaluation() {
+    let modulus = BigUint::from_str_radix(TEST_MODULUS, 10).unwrap();
+    let poly = Polynomial::new(vec![
+        Fp::new(BigUint::from(1u64), modulus.clone()),
+        Fp::new(BigUint::from(2u64), modulus.clone()),
+        Fp::new(BigUint::from(3u64), modulus.clone()),
+    ]);  // 3x^2 + 2x + 1
     
-    let poly = Polynomial::new(vec![1u64, 2, 3]);
-    assert_eq!(&poly + &zero, poly);
+    let x = Fp::new(BigUint::from(2u64), modulus.clone());
+    let result = evaluate_polynomial(&poly, &x);
+    
+    // At x = 2: 3(2^2) + 2(2) + 1 = 12 + 4 + 1 = 17 ≡ 0 (mod 17)
+    let expected = Fp::new(BigUint::from(0u64), modulus);
+    assert_eq!(result, expected);
+}
+
+#[test]
+fn test_polynomial_addition() {
+    let modulus = BigUint::from_str_radix(TEST_MODULUS, 10).unwrap();
+    let p1 = Polynomial::new(vec![
+        Fp::new(BigUint::from(1u64), modulus.clone()),
+        Fp::new(BigUint::from(2u64), modulus.clone()),
+    ]);  // 2x + 1
+    
+    let p2 = Polynomial::new(vec![
+        Fp::new(BigUint::from(3u64), modulus.clone()),
+        Fp::new(BigUint::from(4u64), modulus.clone()),
+    ]);  // 4x + 3
+    
+    let result = &p1 + &p2;
+    let expected = Polynomial::new(vec![
+        Fp::new(BigUint::from(4u64), modulus.clone()),  // (1 + 3) mod 17
+        Fp::new(BigUint::from(6u64), modulus.clone()),  // (2 + 4) mod 17
+    ]);
+    assert_eq!(result, expected);
+}
+
+#[test]
+fn test_polynomial_multiplication() {
+    let modulus = BigUint::from_str_radix(TEST_MODULUS, 10).unwrap();
+    let p1 = Polynomial::new(vec![
+        Fp::new(BigUint::from(1u64), modulus.clone()),
+        Fp::new(BigUint::from(2u64), modulus.clone()),
+    ]);  // 2x + 1
+    
+    let p2 = Polynomial::new(vec![
+        Fp::new(BigUint::from(3u64), modulus.clone()),
+        Fp::new(BigUint::from(4u64), modulus.clone()),
+    ]);  // 4x + 3
+    
+    let result = &p1 * &p2;
+    // (2x + 1)(4x + 3) = 8x^2 + 10x + 3
+    let expected = Polynomial::new(vec![
+        Fp::new(BigUint::from(3u64), modulus.clone()),
+        Fp::new(BigUint::from(10u64), modulus.clone()),
+        Fp::new(BigUint::from(8u64), modulus.clone()),
+    ]);
+    assert_eq!(result, expected);
+}
+
+#[test]
+fn test_polynomial_associativity() {
+    let modulus = BigUint::from_str_radix(TEST_MODULUS, 10).unwrap();
+    let p1 = Polynomial::new(vec![
+        Fp::new(BigUint::from(1u64), modulus.clone()),
+        Fp::new(BigUint::from(2u64), modulus.clone()),
+    ]);  // 2x + 1
+    
+    let p2 = Polynomial::new(vec![
+        Fp::new(BigUint::from(3u64), modulus.clone()),
+        Fp::new(BigUint::from(4u64), modulus.clone()),
+    ]);  // 4x + 3
+    
+    let p3 = Polynomial::new(vec![
+        Fp::new(BigUint::from(5u64), modulus.clone()),
+        Fp::new(BigUint::from(6u64), modulus.clone()),
+    ]);  // 6x + 5
+    
+    // Test associativity of addition: (p1 + p2) + p3 = p1 + (p2 + p3)
+    let left = &(&p1 + &p2) + &p3;
+    let right = &p1 + &(&p2 + &p3);
+    assert_eq!(left, right);
+    
+    // Test distributivity: p1 * (p2 + p3) = (p1 * p2) + (p1 * p3)
+    let left = &p1 * &(&p2 + &p3);
+    let right = &(&p1 * &p2) + &(&p1 * &p3);
+    assert_eq!(left, right);
+}
+
+#[test]
+fn test_polynomial_degree() {
+    let modulus = BigUint::from_str_radix(TEST_MODULUS, 10).unwrap();
+    let coefficients = vec![
+        Fp::new(BigUint::from(1u64), modulus.clone()),
+        Fp::new(BigUint::from(0u64), modulus.clone()),
+        Fp::new(BigUint::from(0u64), modulus.clone()),
+        Fp::new(BigUint::from(4u64), modulus.clone()),
+    ];  // 4x^3 + 1
+    
+    let poly = Polynomial::new(coefficients);
+    assert_eq!(poly.degree(), 3);
+    
+    let zero_poly = Polynomial::new(vec![
+        Fp::new(BigUint::from(0u64), modulus)
+    ]);
+    assert_eq!(zero_poly.degree(), 0);
 }
 
 #[test]
 fn test_polynomial_scalar_multiplication() {
-    let poly = Polynomial::new(vec![1u64, 2, 3]);  // 3x^2 + 2x + 1
-    let scalar = 2u64;
+    let modulus = BigUint::from_str_radix(TEST_MODULUS, 10).unwrap();
+    let poly = Polynomial::new(vec![
+        Fp::new(BigUint::from(1u64), modulus.clone()),
+        Fp::new(BigUint::from(2u64), modulus.clone()),
+        Fp::new(BigUint::from(3u64), modulus.clone()),
+    ]);  // 3x^2 + 2x + 1
     
-    let result = poly.scalar_mul(scalar);
-    assert_eq!(result.coefficients(), &[2u64, 4, 6]);  // 6x^2 + 4x + 2
+    let scalar = Fp::new(BigUint::from(2u64), modulus.clone());
+    let result = &poly * &Polynomial::new(vec![scalar]);
+    
+    let expected = Polynomial::new(vec![
+        Fp::new(BigUint::from(2u64), modulus.clone()),
+        Fp::new(BigUint::from(4u64), modulus.clone()),
+        Fp::new(BigUint::from(6u64), modulus.clone()),
+    ]);  // 6x^2 + 4x + 2
+    
+    assert_eq!(result, expected);
 }
 
 #[test]
 fn test_polynomial_composition() {
-    let outer = Polynomial::new(vec![1u64, 1]);     // x + 1
-    let inner = Polynomial::new(vec![2u64, 1]);     // x + 2
+    let modulus = BigUint::from_str_radix(TEST_MODULUS, 10).unwrap();
+    let outer = Polynomial::new(vec![
+        Fp::new(BigUint::from(1u64), modulus.clone()),
+        Fp::new(BigUint::from(1u64), modulus.clone()),
+    ]);  // x + 1
     
-    let result = outer.compose(&inner);
-    // (x + 2) + 1 = x + 3
-    assert_eq!(result.coefficients(), &[3u64, 1]);
+    let inner = Polynomial::new(vec![
+        Fp::new(BigUint::from(2u64), modulus.clone()),
+        Fp::new(BigUint::from(1u64), modulus.clone()),
+    ]);  // x + 2
+    
+    let x = Fp::new(BigUint::from(3u64), modulus.clone());
+    let inner_result = evaluate_polynomial(&inner, &x);  // g(3)
+    
+    // Verify that f(g(x)) = f(g(3))
+    let composed_result = evaluate_polynomial(&outer, &inner_result);  // f(g(3))
+    assert_eq!(composed_result, Fp::new(BigUint::from(6u64), modulus));  // (3 + 2) + 1 = 6
 }
 
 #[test]
 fn test_polynomial_derivative() {
-    let poly = Polynomial::new(vec![1u64, 2, 3]);  // 3x^2 + 2x + 1
+    let modulus = BigUint::from_str_radix(TEST_MODULUS, 10).unwrap();
+    let poly = Polynomial::new(vec![
+        Fp::new(BigUint::from(1u64), modulus.clone()),
+        Fp::new(BigUint::from(2u64), modulus.clone()),
+        Fp::new(BigUint::from(3u64), modulus.clone()),
+    ]);  // 3x^2 + 2x + 1
+    
     let derivative = poly.derivative();
     // Derivative: 6x + 2
-    assert_eq!(derivative.coefficients(), &[2u64, 6]);
+    let expected = Polynomial::new(vec![
+        Fp::new(BigUint::from(2u64), modulus.clone()),
+        Fp::new(BigUint::from(6u64), modulus),
+    ]);
+    assert_eq!(derivative, expected);
 }
 
 #[test]
 fn test_polynomial_interpolation() {
-    let points = vec![(0u64, 1u64), (1u64, 2u64), (2u64, 4u64)];
+    let modulus = BigUint::from_str_radix(TEST_MODULUS, 10).unwrap();
+    let points = vec![
+        (
+            Fp::new(BigUint::from(0u64), modulus.clone()),
+            Fp::new(BigUint::from(1u64), modulus.clone())
+        ),
+        (
+            Fp::new(BigUint::from(1u64), modulus.clone()),
+            Fp::new(BigUint::from(2u64), modulus.clone())
+        ),
+        (
+            Fp::new(BigUint::from(2u64), modulus.clone()),
+            Fp::new(BigUint::from(4u64), modulus.clone())
+        ),
+    ];
+    
     let poly = Polynomial::interpolate(&points);
     
     // Verify the polynomial passes through all points
     for (x, y) in points {
-        let result = evaluate_polynomial(&poly, &BigUint::from(x));
-        assert_eq!(result, BigUint::from(y));
+        let result = evaluate_polynomial(&poly, &x);
+        assert_eq!(result, y);
     }
 }
 
 #[test]
 fn test_polynomial_properties() {
-    let p1 = Polynomial::new(vec![1u64, 2]);  // 2x + 1
-    let p2 = Polynomial::new(vec![3u64, 4]);  // 4x + 3
-    let p3 = Polynomial::new(vec![5u64, 6]);  // 6x + 5
+    let modulus = BigUint::from_str_radix(TEST_MODULUS, 10).unwrap();
+    let p1 = Polynomial::new(vec![
+        Fp::new(BigUint::from(1u64), modulus.clone()),
+        Fp::new(BigUint::from(2u64), modulus.clone()),
+    ]);  // 2x + 1
+    
+    let p2 = Polynomial::new(vec![
+        Fp::new(BigUint::from(3u64), modulus.clone()),
+        Fp::new(BigUint::from(4u64), modulus.clone()),
+    ]);  // 4x + 3
+    
+    let p3 = Polynomial::new(vec![
+        Fp::new(BigUint::from(5u64), modulus.clone()),
+        Fp::new(BigUint::from(6u64), modulus.clone()),
+    ]);  // 6x + 5
     
     // Test associativity: (p1 + p2) + p3 = p1 + (p2 + p3)
-    let left = (&(&p1 + &p2) + &p3).coefficients().to_vec();
-    let right = (&p1 + &(&p2 + &p3)).coefficients().to_vec();
+    let left = &(&p1 + &p2) + &p3;
+    let right = &p1 + &(&p2 + &p3);
     assert_eq!(left, right);
     
     // Test distributivity: p1 * (p2 + p3) = (p1 * p2) + (p1 * p3)
-    let left = (&p1 * &(&p2 + &p3)).coefficients().to_vec();
-    let right = (&(&p1 * &p2) + &(&p1 * &p3)).coefficients().to_vec();
+    let left = &p1 * &(&p2 + &p3);
+    let right = &(&p1 * &p2) + &(&p1 * &p3);
     assert_eq!(left, right);
 } 

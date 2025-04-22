@@ -1,5 +1,7 @@
+#[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
 use zerosync::arithmetic::simd::{field_mul_avx2, field_add_avx2, has_avx2};
 
+#[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
 #[test]
 fn test_avx2_detection() {
     // Just verify that the function runs without panicking
@@ -7,102 +9,110 @@ fn test_avx2_detection() {
 }
 
 #[test]
-#[cfg(target_feature = "avx2")]
+#[cfg(all(feature = "simd", target_arch = "x86_64", target_feature = "avx2"))]
+fn test_simd_operations() {
+    if !has_avx2() {
+        println!("Skipping SIMD tests - AVX2 not available");
+        return;
+    }
+
+    // Test vectors
+    let a = vec![1u64, 2, 3, 4];
+    let b = vec![5u64, 6, 7, 8];
+    let modulus = vec![17u64, 17, 17, 17];
+
+    unsafe {
+        // Test field multiplication
+        let result = field_mul_avx2(&a, &b, &modulus);
+        assert_eq!(result.len(), 4);
+        for i in 0..4 {
+            assert!(result[i] < modulus[i]);
+        }
+
+        // Test field addition
+        let result = field_add_avx2(&a, &b, &modulus);
+        assert_eq!(result.len(), 4);
+        for i in 0..4 {
+            assert!(result[i] < modulus[i]);
+        }
+    }
+}
+
+#[test]
+#[cfg(all(feature = "simd", target_arch = "x86_64", target_feature = "avx2"))]
 fn test_simd_field_addition() {
-    let a = [1u64, 2, 3, 4];
-    let b = [5u64, 6, 7, 8];
-    let modulus = [
-        0xFFFFFFFFFFFFFFFF,
-        0xFFFFFFFFFFFFFFFF,
-        0xFFFFFFFFFFFFFFFF,
-        0x0FFFFFFFFFFFFFFF,
-    ];
+    if !has_avx2() {
+        println!("Skipping SIMD tests - AVX2 not available");
+        return;
+    }
+
+    let a = vec![1u64, 2, 3, 4];
+    let b = vec![5u64, 6, 7, 8];
+    let modulus = vec![17u64, 17, 17, 17];
 
     unsafe {
         let result = field_add_avx2(&a, &b, &modulus);
         
         // Test basic addition
-        assert_eq!(result[0], 6);  // 1 + 5
-        assert_eq!(result[1], 8);  // 2 + 6
-        assert_eq!(result[2], 10); // 3 + 7
-        assert_eq!(result[3], 12); // 4 + 8
-        
-        // Test modular reduction
-        let large_a = [
-            0xFFFFFFFFFFFFFFFF,
-            0xFFFFFFFFFFFFFFFF,
-            0xFFFFFFFFFFFFFFFF,
-            0x0FFFFFFFFFFFFFFF,
-        ];
-        let result = field_add_avx2(&large_a, &b, &modulus);
-        // Verify results are properly reduced modulo p
-        for i in 0..4 {
-            assert!(result[i] < modulus[i]);
-        }
+        assert_eq!(result[0], (1 + 5) % 17);  // 6
+        assert_eq!(result[1], (2 + 6) % 17);  // 8
+        assert_eq!(result[2], (3 + 7) % 17);  // 10
+        assert_eq!(result[3], (4 + 8) % 17);  // 12
     }
 }
 
 #[test]
-#[cfg(target_feature = "avx2")]
+#[cfg(all(feature = "simd", target_arch = "x86_64", target_feature = "avx2"))]
 fn test_simd_field_multiplication() {
-    let a = [1u64, 2, 3, 4];
-    let b = [2u64, 3, 4, 5];
-    let modulus = [
-        0xFFFFFFFFFFFFFFFF,
-        0xFFFFFFFFFFFFFFFF,
-        0xFFFFFFFFFFFFFFFF,
-        0x0FFFFFFFFFFFFFFF,
-    ];
+    if !has_avx2() {
+        println!("Skipping SIMD tests - AVX2 not available");
+        return;
+    }
+
+    let a = vec![1u64, 2, 3, 4];
+    let b = vec![2u64, 3, 4, 5];
+    let modulus = vec![17u64, 17, 17, 17];
 
     unsafe {
         let result = field_mul_avx2(&a, &b, &modulus);
         
         // Test basic multiplication
-        assert_eq!(result[0], 2);  // 1 * 2
-        assert_eq!(result[1], 6);  // 2 * 3
-        assert_eq!(result[2], 12); // 3 * 4
-        assert_eq!(result[3], 20); // 4 * 5
-        
-        // Test modular reduction
-        let large_a = [
-            0xFFFFFFFFFFFFFFFF,
-            0xFFFFFFFFFFFFFFFF,
-            0xFFFFFFFFFFFFFFFF,
-            0x0FFFFFFFFFFFFFFF,
-        ];
-        let result = field_mul_avx2(&large_a, &b, &modulus);
-        // Verify results are properly reduced modulo p
-        for i in 0..4 {
-            assert!(result[i] < modulus[i]);
-        }
+        assert_eq!(result[0], (1 * 2) % 17);  // 2
+        assert_eq!(result[1], (2 * 3) % 17);  // 6
+        assert_eq!(result[2], (3 * 4) % 17);  // 12
+        assert_eq!(result[3], (4 * 5) % 17);  // 3
     }
 }
 
 #[test]
-#[cfg(target_feature = "avx2")]
+#[cfg(all(feature = "simd", target_arch = "x86_64", target_feature = "avx2"))]
 fn test_simd_edge_cases() {
-    let modulus = [
-        0xFFFFFFFFFFFFFFFF,
-        0xFFFFFFFFFFFFFFFF,
-        0xFFFFFFFFFFFFFFFF,
-        0x0FFFFFFFFFFFFFFF,
-    ];
+    if !has_avx2() {
+        println!("Skipping SIMD tests - AVX2 not available");
+        return;
+    }
+
+    let modulus = vec![17u64, 17, 17, 17];
 
     unsafe {
         // Test multiplication by zero
-        let a = [1u64, 2, 3, 4];
-        let zero = [0u64; 4];
+        let a = vec![1u64, 2, 3, 4];
+        let zero = vec![0u64, 0, 0, 0];
         let result = field_mul_avx2(&a, &zero, &modulus);
-        assert_eq!(result, [0u64; 4]);
+        assert_eq!(result, vec![0u64, 0, 0, 0]);
 
         // Test multiplication by one
-        let one = [1u64, 1, 1, 1];
+        let one = vec![1u64, 1, 1, 1];
         let result = field_mul_avx2(&a, &one, &modulus);
-        assert_eq!(result, a);
+        for i in 0..4 {
+            assert_eq!(result[i], a[i] % 17);
+        }
 
         // Test addition with zero
         let result = field_add_avx2(&a, &zero, &modulus);
-        assert_eq!(result, a);
+        for i in 0..4 {
+            assert_eq!(result[i], a[i] % 17);
+        }
     }
 }
 

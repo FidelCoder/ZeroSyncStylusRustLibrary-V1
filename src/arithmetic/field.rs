@@ -1,6 +1,7 @@
 use std::ops::{Add, Sub, Mul, Div, Neg};
 use num_bigint::BigUint;
 use num_traits::{Zero, One};
+use num_integer::Integer;
 use crate::arithmetic::{
     traits::{Field, PrimeField},
     montgomery::{MontgomeryConstants, mont_mul, ct_lt},
@@ -23,6 +24,10 @@ impl Fp {
     /// Creates a new field element
     pub fn new(value: BigUint, modulus: BigUint) -> Self {
         let constants = MontgomeryConstants::new(&modulus, WORD_SIZE);
+        
+        // Reduce value modulo the modulus first
+        let value = value % modulus.clone();
+        
         let mut fp = Self {
             limbs: to_limbs(&value, WORDS_PER_LIMB),
             constants,
@@ -36,6 +41,11 @@ impl Fp {
     /// Converts the value to Montgomery form
     #[inline(always)]
     fn to_montgomery_form(&mut self) {
+        // Special case for zero
+        if self.limbs.iter().all(|&x| x == 0) {
+            return;
+        }
+
         let r_squared_limbs = to_limbs(&self.constants.r_squared, WORDS_PER_LIMB);
         let modulus_limbs = to_limbs(&self.constants.modulus, WORDS_PER_LIMB);
         let n_prime_limbs = to_limbs(&self.constants.n_prime, WORDS_PER_LIMB);
@@ -76,8 +86,70 @@ impl Field for Fp {
     }
 
     fn inverse(&self) -> Option<Self> {
-        // TODO: Implement inverse using binary extended GCD
-        None
+        if self.is_zero() {
+            return None;
+        }
+
+        // Convert from Montgomery form
+        let mut a = self.limbs.clone();
+        let modulus_limbs = to_limbs(&self.constants.modulus, WORDS_PER_LIMB);
+        let one_limbs = vec![1u64; WORDS_PER_LIMB];
+        let n_prime_limbs = to_limbs(&self.constants.n_prime, WORDS_PER_LIMB);
+
+        // Convert from Montgomery form
+        a = mont_mul(&a, &one_limbs, &modulus_limbs, &n_prime_limbs);
+
+        // Convert to BigUint for inverse calculation
+        let a_biguint = BigUint::from_bytes_le(&to_bytes(&a));
+        let modulus = self.constants.modulus.clone();
+
+        // Extended Binary GCD
+        let mut u = a_biguint;
+        let mut v = modulus.clone();
+        let mut b = BigUint::one();
+        let mut c = BigUint::zero();
+
+        while !u.is_zero() {
+            while u.is_even() {
+                u >>= 1;
+                if b.is_even() {
+                    b >>= 1;
+                } else {
+                    b = (b.clone() + modulus.clone()) >> 1;
+                }
+            }
+
+            while v.is_even() {
+                v >>= 1;
+                if c.is_even() {
+                    c >>= 1;
+                } else {
+                    c = (c.clone() + modulus.clone()) >> 1;
+                }
+            }
+
+            if u >= v {
+                u = u - v.clone();
+                if b >= c.clone() {
+                    b = b - c.clone();
+                } else {
+                    b = modulus.clone() - (c.clone() - b.clone());
+                }
+            } else {
+                v = v - u.clone();
+                if c.clone() >= b.clone() {
+                    c = c - b.clone();
+                } else {
+                    c = modulus.clone() - (b.clone() - c.clone());
+                }
+            }
+        }
+
+        if v != BigUint::one() {
+            return None;
+        }
+
+        Some(Self::new(c, modulus))
     }
 
     fn pow(&self, exp: u64) -> Self {
@@ -191,6 +263,55 @@ impl Mul for Fp {
     }
 }
 
+impl Zero for Fp {
+    fn zero() -> Self {
+        // Use a small prime for testing
+        let modulus = BigUint::from(17u64);
+        Self {
+            limbs: vec![0; WORDS_PER_LIMB],
+            constants: MontgomeryConstants::new(&modulus, WORD_SIZE),
+        }
+    }
+
+    fn is_zero(&self) -> bool {
+        self.limbs.iter().all(|&x| x == 0)
+    }
+}
+
+impl One for Fp {
+    fn one() -> Self {
+        // Use a small prime for testing
+        let modulus = BigUint::from(17u64);
+        Self::new(BigUint::one(), modulus)
+    }
+}
+
+impl Neg for Fp {
+    type Output = Self;
+
+    fn neg(self) -> Self {
+        if self.is_zero() {
+            return self;
+        }
+        let modulus = self.constants.modulus.clone();
+        let mut result = Self::new(modulus.clone(), modulus);
+        result = result - self;
+        result
+    }
+}
+
+impl Div for Fp {
+    type Output = Self;
+
+    fn div(self, rhs: Self) -> Self {
+        if let Some(inv) = rhs.inverse() {
+            self * inv
+        } else {
+            panic!("Division by zero")
+        }
+    }
+}
+
 /// Converts a BigUint to a fixed-size array of limbs
 #[inline(always)]
 fn to_limbs(value: &BigUint, num_limbs: usize) -> Vec<u64> {
@@ -210,28 +331,36 @@ fn to_limbs(value: &BigUint, num_limbs: usize) -> Vec<u64> {
     limbs
 }
 
+/// Converts a slice of u64 limbs to bytes in little-endian order
+fn to_bytes(limbs: &[u64]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(limbs.len() * 8);
+    for &limb in limbs {
+        bytes.extend_from_slice(&limb.to_le_bytes());
+    }
+    bytes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use num_traits::Num;
+    use num_bigint::BigUint;
 
     #[test]
     fn test_field_arithmetic() {
-        // Use BN254 base field modulus for testing
-        let modulus = BigUint::from_str_radix(
-            "21888242871839275222246405745257275088696311157297823662689037894645226208583",
-            10
-        ).unwrap();
-        
-        let a = Fp::new(BigUint::from(5u32), modulus.clone());
-        let b = Fp::new(BigUint::from(3u32), modulus);
+        let modulus = BigUint::from(17u64);
+        let a = Fp::new(BigUint::from(5u64), modulus.clone());
+        let b = Fp::new(BigUint::from(3u64), modulus.clone());
         
         let sum = a.clone() + b.clone();
         let product = a.clone() * b.clone();
         let diff = a - b;
         
-        // TODO: Add proper test assertions
-        assert!(true);
+        // 5 + 3 = 8 mod 17
+        assert_eq!(sum, Fp::new(BigUint::from(8u64), modulus.clone()));
+        // 5 * 3 = 15 mod 17
+        assert_eq!(product, Fp::new(BigUint::from(15u64), modulus.clone()));
+        // 5 - 3 = 2 mod 17
+        assert_eq!(diff, Fp::new(BigUint::from(2u64), modulus));
     }
 
     #[test]

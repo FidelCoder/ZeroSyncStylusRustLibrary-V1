@@ -1,119 +1,112 @@
-use std::sync::OnceLock;
 use num_bigint::BigUint;
-use std::ops::Shl;
-use crate::arithmetic::traits::Field;
 
-/// Thread-local storage for Montgomery constants
-thread_local! {
-    static MONTGOMERY_CONSTANTS: OnceLock<MontgomeryConstants> = OnceLock::new();
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct MontgomeryConstants {
-    r: BigUint,       // R = 2^word_size mod N
-    r_squared: BigUint, // R^2 mod N
-    n_prime: BigUint,   // -N^(-1) mod R
+/// Constants used for Montgomery arithmetic
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MontgomeryConstants {
+    /// The modulus
+    pub modulus: BigUint,
+    /// R^2 mod N where R = 2^(word_size * num_words)
+    pub r_squared: BigUint,
+    /// -N^(-1) mod R where R = 2^word_size
+    pub n_prime: BigUint,
 }
 
 impl MontgomeryConstants {
+    /// Creates new Montgomery constants for the given modulus
     pub fn new(modulus: &BigUint, word_size: u32) -> Self {
-        let r = BigUint::from(1u64).shl(word_size);
+        let r = BigUint::from(1u64) << word_size;
         let r_squared = (&r * &r) % modulus;
-        
-        // Calculate n_prime using extended GCD
-        let n_prime = Self::compute_n_prime(modulus, &r);
+        let n_prime = calculate_n_prime(modulus, word_size);
         
         Self {
-            r,
+            modulus: modulus.clone(),
             r_squared,
             n_prime,
         }
     }
-
-    /// Compute -N^(-1) mod R using extended GCD
-    fn compute_n_prime(n: &BigUint, r: &BigUint) -> BigUint {
-        let (mut t, mut new_t) = (BigUint::from(0u32), BigUint::from(1u32));
-        let (mut r_copy, mut new_r) = (r.clone(), n.clone());
-
-        while !new_r.is_zero() {
-            let quotient = &r_copy / &new_r;
-            (t, new_t) = (new_t.clone(), t - quotient.clone() * new_t);
-            (r_copy, new_r) = (new_r.clone(), r_copy - quotient * new_r);
-        }
-
-        if t < BigUint::from(0u32) {
-            t = t + r;
-        }
-        r - t
-    }
 }
 
-/// Optimized Montgomery multiplication
+/// Performs Montgomery multiplication: (a * b * R^(-1)) mod N
 #[inline(always)]
 pub fn mont_mul(a: &[u64], b: &[u64], n: &[u64], n_prime: &[u64]) -> Vec<u64> {
     let len = a.len();
     let mut t = vec![0u64; len * 2];
     
-    // Step 1: Compute t = a * b
+    // Compute t = a * b
     for i in 0..len {
         let mut carry = 0u64;
         for j in 0..len {
-            let prod = (t[i + j] as u128)
-                    + (a[i] as u128 * b[j] as u128)
-                    + (carry as u128);
-            t[i + j] = prod as u64;
-            carry = (prod >> 64) as u64;
+            let temp = (t[i + j] as u128) + (a[i] as u128 * b[j] as u128) + (carry as u128);
+            t[i + j] = temp as u64;
+            carry = (temp >> 64) as u64;
         }
         t[i + len] = carry;
     }
     
-    // Step 2: Compute m = t * n_prime mod 2^64
+    // Compute m = t * n' mod R
     let mut m = vec![0u64; len];
     for i in 0..len {
         let mut carry = 0u64;
-        let mu = (t[i] as u128 * n_prime[0] as u128) as u64;
         for j in 0..len {
-            let prod = (t[i + j] as u128)
-                    + (mu as u128 * n[j] as u128)
-                    + (carry as u128);
-            t[i + j] = prod as u64;
-            carry = (prod >> 64) as u64;
+            let temp = (m[j] as u128) + (t[i] as u128 * n_prime[j] as u128) + (carry as u128);
+            m[j] = temp as u64;
+            carry = (temp >> 64) as u64;
         }
-        t[i + len] += carry;
     }
     
-    // Step 3: Divide by R (shift right by word_size)
-    let result: Vec<u64> = t[len..].to_vec();
+    // Compute t = (t + m * n) / R
+    let mut carry = 0u64;
+    for i in 0..len {
+        let mut sum = carry;
+        for j in 0..len {
+            let temp = (sum as u128) + (m[j] as u128 * n[i] as u128);
+            sum = temp as u64;
+            carry = (temp >> 64) as u64;
+        }
+        t[i] = sum;
+    }
     
-    // Step 4: Final reduction
-    if result.iter().zip(n.iter()).rev()
-        .find(|(&a, &b)| a != b)
-        .map_or(false, |(a, b)| a >= b) {
+    // Final reduction
+    let mut result = t[len..2*len].to_vec();
+    if !ct_lt(&result, n) {
         let mut borrow = 0i64;
-        let mut final_result = vec![0u64; len];
         for i in 0..len {
             let diff = (result[i] as i128) - (n[i] as i128) - (borrow as i128);
-            final_result[i] = diff as u64;
+            result[i] = diff as u64;
             borrow = if diff < 0 { 1 } else { 0 };
         }
-        final_result
-    } else {
-        result
     }
+    
+    result
 }
 
-/// Constant-time comparison
+/// Constant-time less-than comparison
 #[inline(always)]
 pub fn ct_lt(a: &[u64], b: &[u64]) -> bool {
-    let mut result = 0u8;
-    let mut equal = 1u8;
+    let mut lt = false;
+    let mut eq = true;
     
-    for (x, y) in a.iter().zip(b.iter()).rev() {
-        let lt = ((x < y) as u8) & equal;
-        let gt = ((x > y) as u8) & equal;
-        result |= lt;
-        equal &= !lt & !gt;
+    for i in (0..a.len()).rev() {
+        lt |= eq && (a[i] < b[i]);
+        eq &= a[i] == b[i];
     }
     
-    result == 1
+    lt
+}
+
+/// Calculates -N^(-1) mod R where R = 2^word_size
+fn calculate_n_prime(n: &BigUint, word_size: u32) -> BigUint {
+    let r = BigUint::from(1u64) << word_size;
+    let mut t = BigUint::from(1u64);
+    let mut n_prime = BigUint::from(0u64);
+    
+    for _ in 0..word_size {
+        if (&t * n) % &r == BigUint::from(1u64) {
+            n_prime = t.clone();
+            break;
+        }
+        t = t << 1;
+    }
+    
+    n_prime
 } 

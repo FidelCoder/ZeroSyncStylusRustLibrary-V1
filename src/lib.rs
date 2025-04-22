@@ -4,12 +4,13 @@
 //! with a focus on gas optimization and developer experience.
 
 pub mod arithmetic;
-pub mod curves;
-pub mod utils;
+pub mod curve;
+pub mod util;
+pub mod polynomial;
 
 // Re-export commonly used types
-pub use arithmetic::field::{Field, PrimeField};
-pub use curves::bn254::{BN254, G1Affine, G2Affine};
+pub use arithmetic::traits::{Field, PrimeField};
+pub use curve::bn254::{BN254, G1Affine, G2Affine};
 
 /// Feature flags
 #[cfg(feature = "parallel")]

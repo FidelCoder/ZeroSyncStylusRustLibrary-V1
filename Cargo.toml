@@ -13,19 +13,24 @@ ark-ff = { version = "0.4", optional = true }
 ark-ec = { version = "0.4", optional = true }
 num-bigint = "0.4"
 num-traits = "0.2"
+num-integer = "0.1"
 thiserror = "1.0"
-rayon = { version = "1.7", optional = true }
+rayon = { version = "1.8", optional = true }
 
 [dev-dependencies]
 criterion = "0.5"
 proptest = "1.2"
 
 [features]
-default = []
-parallel = ["rayon"]
+default = ["std"]
 std = []
+parallel = ["rayon"]
+simd = []
 bench-comparison = ["ark-ff", "ark-ec"]
 
 [[bench]]
 name = "field_ops"
 harness = false
+
+[build-dependencies]
+cc = "1.0"

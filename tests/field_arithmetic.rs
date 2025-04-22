@@ -1,7 +1,7 @@
 use num_bigint::BigUint;
-use num_traits::{One, Zero};
+use num_traits::{One, Zero, Num};
+use zerosync::{Field, arithmetic::field::Fp};
 use zerosync::arithmetic::{
-    field::Fp,
     montgomery::{mont_mul, ct_lt},
 };
 use proptest::prelude::*;
@@ -139,4 +139,22 @@ fn test_montgomery_multiplication() {
     let result = mont_mul(&a, &b, &modulus, &n_prime);
     assert_eq!(result.len(), 4);
     // Add more specific assertions based on expected results
+}
+
+#[test]
+fn test_field_arithmetic() {
+    let modulus = BigUint::from(17u64);
+    let a = Fp::new(BigUint::from(5u64), modulus.clone());
+    let b = Fp::new(BigUint::from(3u64), modulus.clone());
+    
+    let sum = a.clone() + b.clone();
+    let product = a.clone() * b.clone();
+    let diff = a - b;
+    
+    // 5 + 3 = 8 mod 17
+    assert_eq!(sum, Fp::new(BigUint::from(8u64), modulus.clone()));
+    // 5 * 3 = 15 mod 17
+    assert_eq!(product, Fp::new(BigUint::from(15u64), modulus.clone()));
+    // 5 - 3 = 2 mod 17
+    assert_eq!(diff, Fp::new(BigUint::from(2u64), modulus));
 } 
