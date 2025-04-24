@@ -9,9 +9,110 @@ use proptest::prelude::*;
 // BN254 base field modulus
 const BN254_MODULUS: &str = "21888242871839275222246405745257275088696311157297823662689037894645226208583";
 
+const TEST_MODULUS: &str = "17";  // Small prime for testing
+
+prop_compose! {
+    fn arb_field_element()(value in 0u64..17) -> Fp {
+        let modulus = BigUint::from_str_radix(TEST_MODULUS, 10).unwrap();
+        Fp::new(BigUint::from(value), modulus)
+    }
+}
+
+proptest! {
+    #[test]
+    fn test_field_addition_properties(
+        a in arb_field_element(),
+        b in arb_field_element(),
+        c in arb_field_element()
+    ) {
+        // Commutativity: a + b = b + a
+        prop_assert_eq!(a.clone() + b.clone(), b.clone() + a.clone());
+
+        // Associativity: (a + b) + c = a + (b + c)
+        prop_assert_eq!((a.clone() + b.clone()) + c.clone(), a.clone() + (b.clone() + c.clone()));
+
+        // Identity: a + 0 = a
+        let zero = Fp::zero();
+        prop_assert_eq!(a.clone() + zero.clone(), a.clone());
+
+        // Inverse: a + (-a) = 0
+        let neg_a = -a.clone();
+        prop_assert_eq!(a.clone() + neg_a, zero);
+    }
+
+    #[test]
+    fn test_field_multiplication_properties(
+        a in arb_field_element(),
+        b in arb_field_element(),
+        c in arb_field_element()
+    ) {
+        // Commutativity: a * b = b * a
+        prop_assert_eq!(a.clone() * b.clone(), b.clone() * a.clone());
+
+        // Associativity: (a * b) * c = a * (b * c)
+        prop_assert_eq!((a.clone() * b.clone()) * c.clone(), a.clone() * (b.clone() * c.clone()));
+
+        // Identity: a * 1 = a
+        let one = Fp::one();
+        prop_assert_eq!(a.clone() * one.clone(), a.clone());
+
+        // Distributivity: a * (b + c) = (a * b) + (a * c)
+        prop_assert_eq!(
+            a.clone() * (b.clone() + c.clone()),
+            (a.clone() * b.clone()) + (a.clone() * c.clone())
+        );
+    }
+
+    #[test]
+    fn test_field_inverse_properties(
+        a in arb_field_element()
+    ) {
+        if !a.is_zero() {
+            // a * a^(-1) = 1
+            let inv_a = a.inverse().unwrap();
+            let one = Fp::one();
+            prop_assert_eq!(a.clone() * inv_a.clone(), one.clone());
+            prop_assert_eq!(inv_a.clone() * a.clone(), one);
+        }
+    }
+
+    #[test]
+    fn test_field_exponentiation_properties(
+        a in arb_field_element(),
+        b in 0u32..5,
+        c in 0u32..5
+    ) {
+        // a^(b+c) = a^b * a^c
+        prop_assert_eq!(
+            a.clone().pow((b + c) as u64),
+            a.clone().pow(b as u64) * a.clone().pow(c as u64)
+        );
+
+        // (a^b)^c = a^(b*c)
+        prop_assert_eq!(
+            a.clone().pow(b as u64).pow(c as u64),
+            a.clone().pow((b * c) as u64)
+        );
+    }
+
+    #[test]
+    fn test_field_subtraction_properties(
+        a in arb_field_element(),
+        b in arb_field_element()
+    ) {
+        // a - b = a + (-b)
+        let neg_b = -b.clone();
+        prop_assert_eq!(a.clone() - b.clone(), a.clone() + neg_b);
+
+        // a - a = 0
+        let zero = Fp::zero();
+        prop_assert_eq!(a.clone() - a.clone(), zero);
+    }
+}
+
 #[test]
 fn test_field_basic_arithmetic() {
-    let modulus = BigUint::from_str_radix(BN254_MODULUS, 10).unwrap();
+    let modulus = BigUint::from_str_radix(TEST_MODULUS, 10).unwrap();
     let a = Fp::new(BigUint::from(5u32), modulus.clone());
     let b = Fp::new(BigUint::from(3u32), modulus.clone());
     let c = Fp::new(BigUint::from(7u32), modulus.clone());

@@ -1,81 +1,118 @@
 use std::ops::{Add, Sub, Mul, Div, Neg};
+use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::RwLock;
+use lazy_static::lazy_static;
 use num_bigint::BigUint;
-use num_traits::{Zero, One};
+use num_traits::{Zero, One, ToPrimitive};
 use num_integer::Integer;
 use crate::arithmetic::{
     traits::{Field, PrimeField},
-    montgomery::{MontgomeryConstants, mont_mul, ct_lt},
+    montgomery::{MontgomeryConstants, MontgomeryForm, mont_mul, ct_lt},
 };
 
 /// Word size for field operations
 const WORD_SIZE: u32 = 64;
 const WORDS_PER_LIMB: usize = 4;
 
+// Cache for commonly used field elements and constants
+lazy_static! {
+    static ref FIELD_CACHE: RwLock<HashMap<BigUint, Arc<FieldCache>>> = RwLock::new(HashMap::new());
+}
+
+struct FieldCache {
+    // Common constants in Montgomery form
+    zero: MontgomeryForm,
+    one: MontgomeryForm,
+    // Pre-computed small values
+    small_values: Vec<MontgomeryForm>,
+    // Montgomery constants
+    constants: MontgomeryConstants,
+}
+
+impl FieldCache {
+    fn new(modulus: &BigUint) -> Self {
+        let constants = MontgomeryConstants::new(modulus, 64);
+        let zero = MontgomeryForm::new(vec![0; 4], constants.clone());
+        let one = {
+            let mut value = vec![0; 4];
+            value[0] = 1;
+            MontgomeryForm::new(value, constants.clone())
+        };
+
+        // Pre-compute small values up to 16
+        let mut small_values = Vec::with_capacity(16);
+        let mut current = one.clone();
+        for _ in 0..16 {
+            small_values.push(current.clone());
+            current = current.mul(&one);
+        }
+
+        Self {
+            zero,
+            one,
+            small_values,
+            constants,
+        }
+    }
+
+    fn get_small_value(&self, value: u64) -> Option<MontgomeryForm> {
+        if value < self.small_values.len() as u64 {
+            Some(self.small_values[value as usize].clone())
+        } else {
+            None
+        }
+    }
+}
+
 /// Represents an element of a prime field using Montgomery arithmetic
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Fp {
-    /// The value in Montgomery form as limbs
-    limbs: Vec<u64>,
-    /// Montgomery arithmetic constants
-    constants: MontgomeryConstants,
+    /// The value in Montgomery form
+    mont_form: MontgomeryForm,
 }
 
 impl Fp {
     /// Creates a new field element
     pub fn new(value: BigUint, modulus: BigUint) -> Self {
-        let constants = MontgomeryConstants::new(&modulus, WORD_SIZE);
-        
-        // Reduce value modulo the modulus first
-        let value = value % modulus.clone();
-        
-        let mut fp = Self {
-            limbs: to_limbs(&value, WORDS_PER_LIMB),
-            constants,
+        // Try to get cached constants
+        let cache = {
+            let cache_map = FIELD_CACHE.read().unwrap();
+            cache_map.get(&modulus).cloned()
         };
-        
+
+        let cache = match cache {
+            Some(cache) => cache,
+            None => {
+                // Create new cache entry
+                let mut cache_map = FIELD_CACHE.write().unwrap();
+                let cache = Arc::new(FieldCache::new(&modulus));
+                cache_map.insert(modulus.clone(), cache.clone());
+                cache
+            }
+        };
+
+        // Check if it's a small value first
+        if let Some(small_value) = value.to_u64().and_then(|v| cache.get_small_value(v)) {
+            return Self { mont_form: small_value };
+        }
+
         // Convert to Montgomery form
-        fp.to_montgomery_form();
-        fp
+        let reduced_value = value % &cache.constants.modulus;
+        let mut mont_form = MontgomeryForm::new(
+            to_limbs(&reduced_value, 4),
+            cache.constants.clone(),
+        );
+        mont_form.reduce();
+
+        Self { mont_form }
     }
 
-    /// Converts the value to Montgomery form
-    #[inline(always)]
-    fn to_montgomery_form(&mut self) {
-        // Special case for zero
-        if self.limbs.iter().all(|&x| x == 0) {
-            return;
-        }
-
-        let r_squared_limbs = to_limbs(&self.constants.r_squared, WORDS_PER_LIMB);
-        let modulus_limbs = to_limbs(&self.constants.modulus, WORDS_PER_LIMB);
-        let n_prime_limbs = to_limbs(&self.constants.n_prime, WORDS_PER_LIMB);
-        
-        self.limbs = mont_mul(
-            &self.limbs,
-            &r_squared_limbs,
-            &modulus_limbs,
-            &n_prime_limbs
-        );
-    }
-
-    /// Performs Montgomery multiplication
-    #[inline(always)]
-    fn mont_mul(&self, other: &Self) -> Self {
-        assert_eq!(self.constants.modulus, other.constants.modulus);
-        let modulus_limbs = to_limbs(&self.constants.modulus, WORDS_PER_LIMB);
-        let n_prime_limbs = to_limbs(&self.constants.n_prime, WORDS_PER_LIMB);
-        
-        let result = mont_mul(
-            &self.limbs,
-            &other.limbs,
-            &modulus_limbs,
-            &n_prime_limbs
-        );
-        
-        Self {
-            limbs: result,
-            constants: self.constants.clone(),
-        }
+    /// Converts the value from Montgomery form
+    pub fn from_montgomery(&self) -> BigUint {
+        let mut mont_form = self.mont_form.clone();
+        mont_form.reduce();
+        BigUint::from_bytes_le(&to_bytes(&mont_form.value))
     }
 }
 
@@ -91,17 +128,17 @@ impl Field for Fp {
         }
 
         // Convert from Montgomery form
-        let mut a = self.limbs.clone();
-        let modulus_limbs = to_limbs(&self.constants.modulus, WORDS_PER_LIMB);
+        let mut a = self.mont_form.value.clone();
+        let modulus_limbs = to_limbs(&self.mont_form.constants.modulus, WORDS_PER_LIMB);
         let one_limbs = vec![1u64; WORDS_PER_LIMB];
-        let n_prime_limbs = to_limbs(&self.constants.n_prime, WORDS_PER_LIMB);
+        let n_prime_limbs = to_limbs(&self.mont_form.constants.n_prime, WORDS_PER_LIMB);
 
         // Convert from Montgomery form
         a = mont_mul(&a, &one_limbs, &modulus_limbs, &n_prime_limbs);
 
         // Convert to BigUint for inverse calculation
         let a_biguint = BigUint::from_bytes_le(&to_bytes(&a));
-        let modulus = self.constants.modulus.clone();
+        let modulus = self.mont_form.constants.modulus.clone();
 
         // Extended Binary GCD
         let mut u = a_biguint;
@@ -154,14 +191,14 @@ impl Field for Fp {
 
     fn pow(&self, exp: u64) -> Self {
         let mut base = self.clone();
-        let mut result = Self::new(BigUint::one(), self.constants.modulus.clone());
+        let mut result = Self::new(BigUint::one(), self.mont_form.constants.modulus.clone());
         let mut e = exp;
 
         while e > 0 {
             if e & 1 == 1 {
-                result = result.mont_mul(&base);
+                result.mont_form = result.mont_form.mul(&base.mont_form);
             }
-            base = base.mont_mul(&base);
+            base.mont_form = base.mont_form.mul(&base.mont_form);
             e >>= 1;
         }
         result
@@ -189,15 +226,15 @@ impl Add for Fp {
 
     #[inline(always)]
     fn add(self, other: Self) -> Self {
-        assert_eq!(self.constants.modulus, other.constants.modulus);
-        let modulus_limbs = to_limbs(&self.constants.modulus, WORDS_PER_LIMB);
+        assert_eq!(self.mont_form.constants.modulus, other.mont_form.constants.modulus);
+        let modulus_limbs = to_limbs(&self.mont_form.constants.modulus, WORDS_PER_LIMB);
         
         let mut sum = vec![0u64; WORDS_PER_LIMB];
         let mut carry = 0u64;
         
         // Constant-time addition with reduction
         for i in 0..WORDS_PER_LIMB {
-            let temp = (self.limbs[i] as u128) + (other.limbs[i] as u128) + (carry as u128);
+            let temp = (self.mont_form.value[i] as u128) + (other.mont_form.value[i] as u128) + (carry as u128);
             sum[i] = temp as u64;
             carry = (temp >> 64) as u64;
         }
@@ -213,8 +250,7 @@ impl Add for Fp {
         }
         
         Self {
-            limbs: sum,
-            constants: self.constants.clone(),
+            mont_form: MontgomeryForm::new(sum, self.mont_form.constants.clone()),
         }
     }
 }
@@ -224,15 +260,15 @@ impl Sub for Fp {
 
     #[inline(always)]
     fn sub(self, other: Self) -> Self {
-        assert_eq!(self.constants.modulus, other.constants.modulus);
-        let modulus_limbs = to_limbs(&self.constants.modulus, WORDS_PER_LIMB);
+        assert_eq!(self.mont_form.constants.modulus, other.mont_form.constants.modulus);
+        let modulus_limbs = to_limbs(&self.mont_form.constants.modulus, WORDS_PER_LIMB);
         
         let mut diff = vec![0u64; WORDS_PER_LIMB];
         let mut borrow = 0i64;
         
         // Constant-time subtraction
         for i in 0..WORDS_PER_LIMB {
-            let temp = (self.limbs[i] as i128) - (other.limbs[i] as i128) - (borrow as i128);
+            let temp = (self.mont_form.value[i] as i128) - (other.mont_form.value[i] as i128) - (borrow as i128);
             diff[i] = temp as u64;
             borrow = if temp < 0 { 1 } else { 0 };
         }
@@ -248,8 +284,7 @@ impl Sub for Fp {
         }
         
         Self {
-            limbs: diff,
-            constants: self.constants.clone(),
+            mont_form: MontgomeryForm::new(diff, self.mont_form.constants.clone()),
         }
     }
 }
@@ -259,7 +294,19 @@ impl Mul for Fp {
 
     #[inline(always)]
     fn mul(self, other: Self) -> Self {
-        self.mont_mul(&other)
+        let modulus_limbs = to_limbs(&self.mont_form.constants.modulus, WORDS_PER_LIMB);
+        let n_prime_limbs = to_limbs(&self.mont_form.constants.n_prime, WORDS_PER_LIMB);
+        
+        let result = mont_mul(
+            &self.mont_form.value,
+            &other.mont_form.value,
+            &modulus_limbs,
+            &n_prime_limbs
+        );
+        
+        Self {
+            mont_form: MontgomeryForm::new(result, self.mont_form.constants.clone()),
+        }
     }
 }
 
@@ -267,14 +314,22 @@ impl Zero for Fp {
     fn zero() -> Self {
         // Use a small prime for testing
         let modulus = BigUint::from(17u64);
-        Self {
-            limbs: vec![0; WORDS_PER_LIMB],
-            constants: MontgomeryConstants::new(&modulus, WORD_SIZE),
+        let cache = {
+            let cache_map = FIELD_CACHE.read().unwrap();
+            cache_map.get(&modulus).cloned()
+        };
+
+        match cache {
+            Some(cache) => Self { mont_form: cache.zero.clone() },
+            None => Self::new(BigUint::zero(), modulus)
         }
     }
 
     fn is_zero(&self) -> bool {
-        self.limbs.iter().all(|&x| x == 0)
+        // Check if all limbs are zero after reduction
+        let mut mont_form = self.mont_form.clone();
+        mont_form.reduce();
+        mont_form.value.iter().all(|&x| x == 0)
     }
 }
 
@@ -282,7 +337,15 @@ impl One for Fp {
     fn one() -> Self {
         // Use a small prime for testing
         let modulus = BigUint::from(17u64);
-        Self::new(BigUint::one(), modulus)
+        let cache = {
+            let cache_map = FIELD_CACHE.read().unwrap();
+            cache_map.get(&modulus).cloned()
+        };
+
+        match cache {
+            Some(cache) => Self { mont_form: cache.one.clone() },
+            None => Self::new(BigUint::one(), modulus)
+        }
     }
 }
 
@@ -293,10 +356,11 @@ impl Neg for Fp {
         if self.is_zero() {
             return self;
         }
-        let modulus = self.constants.modulus.clone();
-        let mut result = Self::new(modulus.clone(), modulus);
-        result = result - self;
-        result
+        let modulus = self.mont_form.constants.modulus.clone();
+        // Create a field element representing the modulus
+        let modulus_elem = Self::new(modulus.clone(), modulus);
+        // Subtract self from modulus to get the negation
+        modulus_elem - self
     }
 }
 

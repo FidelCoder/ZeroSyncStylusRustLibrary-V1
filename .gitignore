@@ -1,2 +1,4 @@
 .cursor
 .gitignore
+Cargo.lock
+target/
