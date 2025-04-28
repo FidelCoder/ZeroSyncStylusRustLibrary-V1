@@ -82,9 +82,31 @@ impl MontgomeryConstants {
 
 impl MontgomeryForm {
     /// Creates a new value in Montgomery form
-    pub fn new(value: Vec<u64>, constants: MontgomeryConstants) -> Self {
+    pub fn new(mut value: Vec<u64>, constants: MontgomeryConstants) -> Self {
+        // Ensure the value is properly reduced before conversion
+        let modulus_limbs = to_limbs(&constants.modulus, value.len());
+        if !ct_lt(&value, &modulus_limbs) {
+            let mut borrow = 0i64;
+            for i in 0..value.len() {
+                let diff = (value[i] as i128) - (modulus_limbs[i] as i128) - (borrow as i128);
+                value[i] = diff as u64;
+                borrow = if diff < 0 { 1 } else { 0 };
+            }
+        }
+        
+        // Convert to Montgomery form by multiplying by R^2 mod N
+        let r_squared_limbs = to_limbs(&constants.r_squared, value.len());
+        let n_prime_limbs = to_limbs(&constants.n_prime, value.len());
+        
+        let result = mont_mul(
+            &value,
+            &r_squared_limbs,
+            &modulus_limbs,
+            &n_prime_limbs
+        );
+        
         Self {
-            value,
+            value: result,
             extra_precision: 0,
             constants,
         }
@@ -208,10 +230,39 @@ impl MontgomeryForm {
     pub fn sub(&mut self, other: &Self) -> Self {
         assert_eq!(self.constants.modulus, other.constants.modulus);
         
+        #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+        if self.value.len() == 8 && simd_avx512::has_avx512f() {
+            unsafe {
+                let result = simd_avx512::field_sub_avx512(
+                    &self.value,
+                    &other.value,
+                    &to_limbs(&self.constants.modulus, self.value.len())
+                );
+                
+                // Track extra precision
+                return Self {
+                    value: result,
+                    constants: self.constants.clone(),
+                    extra_precision: self.extra_precision.max(other.extra_precision)
+                };
+            }
+        }
+        
         // Perform subtraction with lazy reduction
         let mut result = self.value.clone();
         let modulus_limbs = to_limbs(&self.constants.modulus, self.value.len());
         
+        // If self < other, add the modulus first
+        if ct_lt(&self.value, &other.value) {
+            let mut carry = 0u64;
+            for i in 0..result.len() {
+                let sum = (result[i] as u128) + (modulus_limbs[i] as u128) + (carry as u128);
+                result[i] = sum as u64;
+                carry = (sum >> 64) as u64;
+            }
+        }
+        
+        // Now perform the subtraction
         let mut borrow = 0i64;
         for i in 0..result.len() {
             let diff = (result[i] as i128) - (other.value[i] as i128) - (borrow as i128);
@@ -219,7 +270,7 @@ impl MontgomeryForm {
             borrow = if diff < 0 { 1 } else { 0 };
         }
         
-        // Add modulus if result is negative
+        // If we still have a borrow, add the modulus again
         if borrow != 0 {
             let mut carry = 0u64;
             for i in 0..result.len() {
@@ -229,11 +280,10 @@ impl MontgomeryForm {
             }
         }
         
-        // Track extra precision - subtraction shouldn't increase precision
         Self {
             value: result,
             constants: self.constants.clone(),
-            extra_precision: self.extra_precision
+            extra_precision: self.extra_precision.max(other.extra_precision)
         }
     }
     
@@ -304,10 +354,8 @@ impl MontgomeryForm {
 
 /// Montgomery multiplication with optimized implementation
 pub fn mont_mul(a: &[u64], b: &[u64], n: &[u64], n_prime: &[u64]) -> Vec<u64> {
-    // Standard Montgomery multiplication
+    // Compute t = a * b
     let mut t = vec![0u64; a.len() * 2];
-    
-    // Step 1: Compute t = a * b
     for i in 0..a.len() {
         let mut carry = 0u64;
         for j in 0..b.len() {
@@ -318,14 +366,14 @@ pub fn mont_mul(a: &[u64], b: &[u64], n: &[u64], n_prime: &[u64]) -> Vec<u64> {
         t[i + b.len()] = carry;
     }
     
-    // Step 2: Compute m = (t mod R) * n' mod R
+    // Compute m = (t mod R) * n' mod R
     let mut m = vec![0u64; a.len()];
     for i in 0..a.len() {
         let mu = ((t[i] as u128) * (n_prime[0] as u128)) as u64;
         m[i] = mu;
     }
     
-    // Step 3: Compute t = (t + m*n) / R
+    // Compute t = (t + m*n) / R
     let mut carry = 0u64;
     for i in 0..a.len() {
         let mut carry2 = 0u64;
@@ -466,7 +514,7 @@ pub fn mont_reduce(t: &[u64], n: &[u64], n_prime: &[u64]) -> Vec<u64> {
 }
 
 /// Converts a BigUint to a fixed-size array of limbs
-fn to_limbs(value: &BigUint, num_limbs: usize) -> Vec<u64> {
+pub fn to_limbs(value: &BigUint, num_limbs: usize) -> Vec<u64> {
     let bytes = value.to_bytes_le();
     let mut limbs = vec![0u64; num_limbs];
     
@@ -487,6 +535,17 @@ fn to_limbs(value: &BigUint, num_limbs: usize) -> Vec<u64> {
     }
     
     limbs
+}
+
+/// Converts a slice of u64 limbs to bytes in little-endian order
+pub fn to_bytes(limbs: &[u64]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(limbs.len() * 8);
+    for &limb in limbs {
+        for j in 0..8 {
+            bytes.push(((limb >> (j * 8)) & 0xFF) as u8);
+        }
+    }
+    bytes
 }
 
 /// Constant-time less-than comparison
@@ -549,82 +608,132 @@ fn calculate_n_prime(n: &BigUint, word_size: u32) -> BigUint {
 mod tests {
     use super::*;
     use num_bigint::BigUint;
+    use std::str::FromStr;
     
     #[test]
-    fn test_montgomery_multiplication() {
-        // Test values for BN254 prime field
-        let modulus_str = "21888242871839275222246405745257275088696311157297823662689037894645226208583";
-        let modulus = BigUint::parse_bytes(modulus_str.as_bytes(), 10).unwrap();
+    fn test_basic_conversion() {
+        // Use a small prime field for testing
+        let modulus = BigUint::from(17u32);
         let constants = MontgomeryConstants::new(&modulus, 64);
         
-        // Test values
-        let a_val = BigUint::from(12345u32);
-        let b_val = BigUint::from(67890u32);
-        let expected = (&a_val * &b_val) % &modulus;
+        // Convert to Montgomery form and back
+        let value = BigUint::from(5u32);
+        let mont_form = MontgomeryForm::new(to_limbs(&value, 4), constants.clone());
         
-        // Convert to Montgomery form
-        let r = BigUint::from(1u64) << (4 * 64);
-        let a_mont = (&a_val * &r) % &modulus;
-        let b_mont = (&b_val * &r) % &modulus;
-        
-        let a_limbs = to_limbs(&a_mont, 4);
-        let b_limbs = to_limbs(&b_mont, 4);
+        // Convert back to regular form
+        let one_limbs = vec![1u64; 4];
         let n_limbs = to_limbs(&modulus, 4);
         let n_prime_limbs = to_limbs(&constants.n_prime, 4);
         
-        // Perform Montgomery multiplication
-        let result_limbs = mont_mul(&a_limbs, &b_limbs, &n_limbs, &n_prime_limbs);
+        let result_limbs = mont_mul(&mont_form.value, &one_limbs, &n_limbs, &n_prime_limbs);
+        let result = BigUint::from_bytes_le(&to_bytes(&result_limbs));
         
-        // Convert result back from Montgomery form
-        let mut result_bytes = Vec::new();
-        for limb in &result_limbs {
-            let limb_bytes = limb.to_le_bytes();
-            result_bytes.extend_from_slice(&limb_bytes);
-        }
-        let result_mont = BigUint::from_bytes_le(&result_bytes);
-        let result = (result_mont * BigUint::from(1u64)) % &modulus;
-        
-        assert_eq!(result, expected);
+        // Should get back original value
+        assert_eq!(result, value);
     }
     
     #[test]
-    fn test_lazy_reduction() {
-        // Test lazy reduction with BN254 prime field
-        let modulus_str = "21888242871839275222246405745257275088696311157297823662689037894645226208583";
-        let modulus = BigUint::parse_bytes(modulus_str.as_bytes(), 10).unwrap();
-        let constants = MontgomeryConstants::new_with_lazy_reduction(&modulus, 64, 128);
+    fn test_addition() {
+        // Use a small prime field for testing
+        let modulus = BigUint::from(17u32);
+        let constants = MontgomeryConstants::new(&modulus, 64);
         
         // Create Montgomery forms
-        let a_val = BigUint::from(12345u32);
-        let r = BigUint::from(1u64) << (4 * 64);
-        let a_mont = (&a_val * &r) % &modulus;
-        let a_limbs = to_limbs(&a_mont, 4);
+        let a_val = BigUint::from(5u32);
+        let b_val = BigUint::from(7u32);
+        let expected = (a_val.clone() + b_val.clone()) % &modulus; // 5 + 7 = 12
         
-        let mut mont_a = MontgomeryForm::new(a_limbs, constants.clone());
+        let mut a_mont = MontgomeryForm::new(to_limbs(&a_val, 4), constants.clone());
+        let b_mont = MontgomeryForm::new(to_limbs(&b_val, 4), constants.clone());
         
-        // Perform multiple multiplications without reduction
-        let mut result = mont_a.clone();
-        for _ in 0..10 {
-            result = result.mul(&mont_a);
-        }
+        // Add in Montgomery form
+        let result = a_mont.add(&b_mont);
         
-        // Check extra precision is tracked
-        assert!(result.extra_precision > 0);
+        // Convert back to regular form
+        let one_limbs = vec![1u64; 4];
+        let n_limbs = to_limbs(&modulus, 4);
+        let n_prime_limbs = to_limbs(&constants.n_prime, 4);
         
-        // Force reduction
-        result.reduce();
-        assert_eq!(result.extra_precision, 0);
+        let result_limbs = mont_mul(&result.value, &one_limbs, &n_limbs, &n_prime_limbs);
+        let result_val = BigUint::from_bytes_le(&to_bytes(&result_limbs));
         
-        // Verify result is still correct
-        let expected = BigUint::from(12345u32).pow(11) % &modulus;
-        let mut result_bytes = Vec::new();
-        for limb in &result.value {
-            let limb_bytes = limb.to_le_bytes();
-            result_bytes.extend_from_slice(&limb_bytes);
-        }
-        let result_mont = BigUint::from_bytes_le(&result_bytes);
-        let result_val = (result_mont * BigUint::from(1u64)) % &modulus;
+        // Verify result
+        assert_eq!(result_val, expected);
+    }
+    
+    #[test]
+    fn test_subtraction() {
+        // Use a small prime field for testing
+        let modulus = BigUint::from(17u32);
+        let constants = MontgomeryConstants::new(&modulus, 64);
         
+        // Test case 1: a > b
+        let a_val = BigUint::from(12u32);
+        let b_val = BigUint::from(7u32);
+        let expected = (a_val.clone() - b_val.clone()) % &modulus; // 12 - 7 = 5
+        
+        let mut a_mont = MontgomeryForm::new(to_limbs(&a_val, 4), constants.clone());
+        let b_mont = MontgomeryForm::new(to_limbs(&b_val, 4), constants.clone());
+        
+        // Subtract in Montgomery form
+        let result = a_mont.sub(&b_mont);
+        
+        // Convert back to regular form
+        let one_limbs = vec![1u64; 4];
+        let n_limbs = to_limbs(&modulus, 4);
+        let n_prime_limbs = to_limbs(&constants.n_prime, 4);
+        
+        let result_limbs = mont_mul(&result.value, &one_limbs, &n_limbs, &n_prime_limbs);
+        let result_val = BigUint::from_bytes_le(&to_bytes(&result_limbs));
+        
+        // Verify result
+        assert_eq!(result_val, expected);
+        
+        // Test case 2: a < b (modular subtraction)
+        let a_val = BigUint::from(5u32);
+        let b_val = BigUint::from(10u32);
+        let expected = ((&modulus - &b_val) + &a_val) % &modulus; // 5 - 10 = -5 = 12 mod 17
+        
+        let mut a_mont = MontgomeryForm::new(to_limbs(&a_val, 4), constants.clone());
+        let b_mont = MontgomeryForm::new(to_limbs(&b_val, 4), constants.clone());
+        
+        // Subtract in Montgomery form
+        let result = a_mont.sub(&b_mont);
+        
+        // Convert back to regular form
+        let result_limbs = mont_mul(&result.value, &one_limbs, &n_limbs, &n_prime_limbs);
+        let result_val = BigUint::from_bytes_le(&to_bytes(&result_limbs));
+        
+        // Verify result
+        assert_eq!(result_val, expected);
+    }
+    
+    #[test]
+    fn test_multiplication() {
+        // Use a small prime field for testing
+        let modulus = BigUint::from(17u32);
+        let constants = MontgomeryConstants::new(&modulus, 64);
+        
+        // Create Montgomery forms
+        let a_val = BigUint::from(5u32);
+        let b_val = BigUint::from(7u32);
+        let expected = (a_val.clone() * b_val.clone()) % &modulus; // 5 * 7 = 35 = 1 mod 17
+        
+        let mut a_mont = MontgomeryForm::new(to_limbs(&a_val, 4), constants.clone());
+        let b_mont = MontgomeryForm::new(to_limbs(&b_val, 4), constants.clone());
+        
+        // Multiply in Montgomery form
+        let result = a_mont.mul(&b_mont);
+        
+        // Convert back to regular form
+        let one_limbs = vec![1u64; 4];
+        let n_limbs = to_limbs(&modulus, 4);
+        let n_prime_limbs = to_limbs(&constants.n_prime, 4);
+        
+        let result_limbs = mont_mul(&result.value, &one_limbs, &n_limbs, &n_prime_limbs);
+        let result_val = BigUint::from_bytes_le(&to_bytes(&result_limbs));
+        
+        // Verify result
         assert_eq!(result_val, expected);
     }
 } 

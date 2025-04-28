@@ -3,6 +3,7 @@ use num_bigint::BigUint;
 use std::ops::{Add, Mul, Neg};
 use std::str::FromStr;
 use crate::arithmetic::traits::Field;
+use num_traits::Zero;
 
 /// BN254 elliptic curve implementation
 #[derive(Debug, Clone)]
@@ -171,6 +172,12 @@ impl G1Affine {
         
         let two = Fp::new(BigUint::from(2u32), self.modulus());
         let denominator = two.clone() * self.y.clone();
+        
+        // Check if denominator is zero to avoid division by zero
+        if denominator.is_zero() {
+            return Self::identity(&self.modulus());
+        }
+        
         let lambda = numerator * denominator.inverse().unwrap();
         
         // x' = λ² - 2x
@@ -191,10 +198,41 @@ impl G1Affine {
     }
     
     /// Get the modulus of the field
-    fn modulus(&self) -> BigUint {
-        // Extract modulus from one of the field elements
-        let modulus_str = "21888242871839275222246405745257275088696311157297823662689037894645226208583";
-        BigUint::from_str(modulus_str).unwrap()
+    pub fn modulus(&self) -> BigUint {
+        self.x.modulus()
+    }
+    
+    /// Windowed scalar multiplication using a window size of 4 bits
+    pub fn windowed_mul(&self, scalar: &BigUint) -> Self {
+        const WINDOW_SIZE: usize = 4;
+        const WINDOW_MASK: u64 = (1 << WINDOW_SIZE) - 1;
+        
+        // Precompute points for each window
+        let mut window_points = vec![Self::identity(&self.modulus()); 1 << WINDOW_SIZE];
+        window_points[1] = self.clone();
+        for i in 2..(1 << WINDOW_SIZE) {
+            window_points[i] = window_points[i-1].clone() + self.clone();
+        }
+        
+        let mut result = Self::identity(&self.modulus());
+        let mut temp = self.clone();
+        
+        // Process scalar in windows
+        let mut remaining_scalar = scalar.clone();
+        while !remaining_scalar.is_zero() {
+            let window = (&remaining_scalar & BigUint::from(WINDOW_MASK)).to_u64_digits()[0];
+            if window != 0 {
+                result = result + window_points[window as usize].clone();
+            }
+            
+            // Shift the window
+            for _ in 0..WINDOW_SIZE {
+                temp = temp.double();
+            }
+            remaining_scalar >>= WINDOW_SIZE;
+        }
+        
+        result
     }
 }
 
@@ -224,6 +262,12 @@ impl Add for G1Affine {
         // Addition formula: λ = (y2 - y1) / (x2 - x1)
         let y_diff = other.y - self.y.clone();
         let x_diff = other.x.clone() - self.x.clone();
+        
+        // Check if x_diff is zero to avoid division by zero
+        if x_diff.is_zero() {
+            return Self::identity(&self.modulus());
+        }
+        
         let lambda = y_diff * x_diff.inverse().unwrap();
         
         // x3 = λ² - x1 - x2
@@ -287,6 +331,190 @@ impl Mul<u64> for G1Affine {
     }
 }
 
+impl G2Affine {
+    /// Creates the identity point (point at infinity)
+    pub fn identity(modulus: &BigUint) -> Self {
+        let zero = Fp2::zero(modulus);
+        Self {
+            x: zero.clone(),
+            y: zero,
+            infinity: true,
+        }
+    }
+    
+    /// Point doubling with lazy reduction
+    pub fn double(&self) -> Self {
+        if self.infinity {
+            return self.clone();
+        }
+        
+        // Formula: λ = (3x²) / (2y)
+        let x_squared = self.x.square();
+        
+        // Create field element for 3
+        let three_c0 = Fp::new(BigUint::from(3u32), self.x.c0.modulus());
+        let three_c1 = Fp::new(BigUint::from(0u32), self.x.c0.modulus()); 
+        let three = Fp2::new(three_c0, three_c1);
+        
+        let numerator = three.mul(&x_squared);
+        
+        // Create field element for 2
+        let two_c0 = Fp::new(BigUint::from(2u32), self.x.c0.modulus());
+        let two_c1 = Fp::new(BigUint::from(0u32), self.x.c0.modulus());
+        let two = Fp2::new(two_c0, two_c1);
+        
+        let denominator = two.mul(&self.y);
+        
+        // Check if denominator is zero to avoid division by zero
+        if denominator.c0.is_zero() && denominator.c1.is_zero() {
+            return Self::identity(&self.x.c0.modulus());
+        }
+        
+        let lambda = match denominator.inverse() {
+            Some(inv) => numerator.mul(&inv),
+            None => return Self::identity(&self.x.c0.modulus())
+        };
+        
+        // x' = λ² - 2x
+        let lambda_squared = lambda.square();
+        let two_x = two.mul(&self.x);
+        let x3 = lambda_squared.sub(&two_x);
+        
+        // y' = λ(x - x') - y
+        let x_diff = self.x.sub(&x3);
+        let lambda_x_diff = lambda.mul(&x_diff);
+        let y3 = lambda_x_diff.sub(&self.y);
+        
+        Self {
+            x: x3,
+            y: y3,
+            infinity: false,
+        }
+    }
+    
+    /// Windowed scalar multiplication using a window size of 4 bits
+    pub fn windowed_mul(&self, scalar: &BigUint) -> Self {
+        const WINDOW_SIZE: usize = 4;
+        const WINDOW_MASK: u64 = (1 << WINDOW_SIZE) - 1;
+        
+        // Precompute points for each window
+        let mut window_points = vec![Self::identity(&self.x.c0.modulus()); 1 << WINDOW_SIZE];
+        window_points[1] = self.clone();
+        for i in 2..(1 << WINDOW_SIZE) {
+            window_points[i] = window_points[i-1].clone() + self.clone();
+        }
+        
+        let mut result = Self::identity(&self.x.c0.modulus());
+        let mut temp = self.clone();
+        
+        // Process scalar in windows
+        let mut remaining_scalar = scalar.clone();
+        while !remaining_scalar.is_zero() {
+            let window = (&remaining_scalar & BigUint::from(WINDOW_MASK)).to_u64_digits()[0];
+            if window != 0 {
+                result = result + window_points[window as usize].clone();
+            }
+            
+            // Shift the window
+            for _ in 0..WINDOW_SIZE {
+                temp = temp.double();
+            }
+            remaining_scalar >>= WINDOW_SIZE;
+        }
+        
+        result
+    }
+}
+
+impl Add for G2Affine {
+    type Output = Self;
+    
+    fn add(self, other: Self) -> Self {
+        // Check for identity points
+        if self.infinity {
+            return other;
+        }
+        if other.infinity {
+            return self;
+        }
+        
+        // Check for point doubling
+        if self.x == other.x && self.y == other.y {
+            return self.double();
+        }
+        
+        // Check for inverses (P + (-P) = O)
+        let neg_y = self.y.neg();
+        if self.x == other.x && neg_y == other.y {
+            return Self::identity(&self.x.c0.modulus());
+        }
+        
+        // Addition formula: λ = (y2 - y1) / (x2 - x1)
+        let y_diff = other.y.sub(&self.y);
+        let x_diff = other.x.sub(&self.x);
+        
+        // Check if x_diff is zero to avoid division by zero
+        if x_diff.c0.is_zero() && x_diff.c1.is_zero() {
+            return Self::identity(&self.x.c0.modulus());
+        }
+        
+        let lambda = match x_diff.inverse() {
+            Some(inv) => y_diff.mul(&inv),
+            None => return Self::identity(&self.x.c0.modulus())
+        };
+        
+        // x3 = λ² - x1 - x2
+        let lambda_squared = lambda.square();
+        let x3 = lambda_squared.sub(&self.x).sub(&other.x);
+        
+        // y3 = λ(x1 - x3) - y1
+        let x_diff = self.x.sub(&x3);
+        let y3 = lambda.mul(&x_diff).sub(&self.y);
+        
+        Self {
+            x: x3,
+            y: y3,
+            infinity: false,
+        }
+    }
+}
+
+impl Neg for G2Affine {
+    type Output = Self;
+    
+    fn neg(self) -> Self {
+        if self.infinity {
+            return self;
+        }
+        
+        Self {
+            x: self.x,
+            y: self.y.neg(),
+            infinity: self.infinity,
+        }
+    }
+}
+
+impl Mul<u64> for G2Affine {
+    type Output = Self;
+    
+    fn mul(self, scalar: u64) -> Self {
+        let mut result = Self::identity(&self.x.c0.modulus());
+        let mut temp = self;
+        let mut s = scalar;
+        
+        while s > 0 {
+            if s & 1 == 1 {
+                result = result + temp.clone();
+            }
+            temp = temp.double();
+            s >>= 1;
+        }
+        
+        result
+    }
+}
+
 impl Fp2 {
     /// Create a new Fp2 element
     pub fn new(c0: Fp, c1: Fp) -> Self {
@@ -319,9 +547,17 @@ impl Fp2 {
         
         let ac = a.clone() * c.clone();
         let bd = b.clone() * d.clone();
-        let abcd = (a.clone() + b.clone()) * (c.clone() + d.clone());
         
+        // Calculate (a+b)(c+d)
+        let a_plus_b = a.clone() + b.clone();
+        let c_plus_d = c.clone() + d.clone();
+        let abcd = a_plus_b * c_plus_d;
+        
+        // For c0 = ac - bd, we need to handle modular subtraction
+        // We'll use the modular subtraction built into the field implementation
         let c0 = ac.clone() - bd.clone();
+        
+        // For c1 = abcd - ac - bd, we'll use field operations
         let c1 = abcd - ac - bd;
         
         Self { c0, c1 }
@@ -361,8 +597,12 @@ impl Fp2 {
         let b2 = b.clone() * b.clone();
         let ab = a.clone() * b.clone();
         
+        // For c0 = a² - b², we'll use field operations
         let c0 = a2 - b2;
-        let c1 = ab.clone() + ab;
+        
+        // For c1 = 2ab, we'll use field operations
+        let two = Fp::new(BigUint::from(2u32), a.modulus());
+        let c1 = two * ab;
         
         Self { c0, c1 }
     }
@@ -387,23 +627,10 @@ impl Fp2 {
     }
 }
 
-impl G2Affine {
-    /// Creates the identity point (point at infinity) in G2
-    pub fn identity(modulus: &BigUint) -> Self {
-        let zero_fp = Fp::new(BigUint::from(0u32), modulus.clone());
-        let zero_fp2 = Fp2 { c0: zero_fp.clone(), c1: zero_fp };
-        
-        Self {
-            x: zero_fp2.clone(),
-            y: zero_fp2,
-            infinity: true,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use num_traits::Zero;
     
     #[test]
     fn test_point_on_curve() {
@@ -488,5 +715,114 @@ mod tests {
         // Due to the simplified implementation, we're just validating that this runs
         // A real implementation would verify that g2 is on the twisted curve
         assert!(!g2.infinity);
+    }
+    
+    #[test]
+    fn test_g2_point_addition() {
+        let curve = BN254::new();
+        let g = curve.g2_generator();
+        
+        // Test point addition
+        let p2 = g.clone() + g.clone();
+        assert!(curve.is_on_curve_g2(&p2));
+        
+        // Test point doubling
+        let p2_double = g.clone().double();
+        assert!(curve.is_on_curve_g2(&p2_double));
+        assert_eq!(p2, p2_double);
+        
+        // Test identity point
+        let identity = G2Affine::identity(&curve.modulus);
+        let p_plus_identity = g.clone() + identity.clone();
+        assert_eq!(p_plus_identity, g);
+        
+        // Test inverse points
+        let neg_g = g.clone().neg();
+        let p_plus_neg = g.clone() + neg_g;
+        assert!(p_plus_neg.infinity);
+    }
+    
+    #[test]
+    fn test_g2_scalar_multiplication() {
+        let curve = BN254::new();
+        let g = curve.g2_generator();
+        
+        // Test scalar multiplication
+        let p2 = g.clone() * 2;
+        let p3 = g.clone() * 3;
+        let p4 = g.clone() * 4;
+        
+        assert!(curve.is_on_curve_g2(&p2));
+        assert!(curve.is_on_curve_g2(&p3));
+        assert!(curve.is_on_curve_g2(&p4));
+        
+        // Verify scalar multiplication properties
+        let p2_plus_p2 = p2.clone() + p2.clone();
+        assert_eq!(p2_plus_p2, p4);
+        
+        let p2_plus_g = p2 + g;
+        assert_eq!(p2_plus_g, p3);
+    }
+    
+    #[test]
+    fn test_g2_generator_correctness() {
+        let curve = BN254::new();
+        let g = curve.g2_generator();
+        
+        // Verify generator point is on the curve
+        assert!(curve.is_on_curve_g2(&g));
+        
+        // Verify generator point is not the identity
+        assert!(!g.infinity);
+        
+        // Verify generator point coordinates are non-zero
+        assert!(!g.x.c0.is_zero());
+        assert!(!g.x.c1.is_zero());
+        assert!(!g.y.c0.is_zero());
+        assert!(!g.y.c1.is_zero());
+    }
+    
+    #[test]
+    fn test_windowed_scalar_multiplication_g1() {
+        let curve = BN254::new();
+        let g = curve.g1_generator();
+        
+        // Test with various scalar values
+        let scalars = vec![
+            BigUint::from(1u32),
+            BigUint::from(2u32),
+            BigUint::from(10u32),
+            BigUint::from(100u32),
+            BigUint::from_str("123456789").unwrap(),
+        ];
+        
+        for scalar in scalars {
+            let p1 = g.windowed_mul(&scalar);
+            let p2 = g.clone() * scalar.to_u64_digits()[0];
+            assert_eq!(p1, p2);
+            assert!(curve.is_on_curve(&p1));
+        }
+    }
+    
+    #[test]
+    fn test_windowed_scalar_multiplication_g2() {
+        let curve = BN254::new();
+        let g = curve.g2_generator();
+        
+        // Test with various scalar values
+        let scalars = vec![
+            BigUint::from(1u32),
+            BigUint::from(2u32),
+            BigUint::from(10u32),
+            BigUint::from(100u32),
+            BigUint::from_str("123456789").unwrap(),
+        ];
+        
+        for scalar in scalars {
+            let p1 = g.windowed_mul(&scalar);
+            let p2 = g.clone() * scalar.to_u64_digits()[0];
+            assert_eq!(p1, p2);
+            assert!(curve.is_on_curve_g2(&p1));
+        }
     }
 } 

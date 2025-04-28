@@ -4,12 +4,14 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 use lazy_static::lazy_static;
 use num_bigint::BigUint;
+use std::cmp::Ordering;
 use num_traits::{Zero, One, ToPrimitive};
 use num_integer::Integer;
 use crate::arithmetic::{
     traits::{Field, PrimeField},
-    montgomery::{MontgomeryConstants, MontgomeryForm, mont_mul, ct_lt},
+    montgomery::{MontgomeryConstants, MontgomeryForm, mont_mul, ct_lt, to_limbs, to_bytes},
 };
+use std::str::FromStr;
 
 /// Word size for field operations
 const WORD_SIZE: u32 = 64;
@@ -72,6 +74,21 @@ pub struct Fp {
     mont_form: MontgomeryForm,
 }
 
+impl PartialOrd for Fp {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        // First, make sure we're working with the same modulus
+        if self.mont_form.constants.modulus != other.mont_form.constants.modulus {
+            return None;
+        }
+        
+        // Convert both values to standard form for comparison
+        let a_val = self.from_montgomery();
+        let b_val = other.from_montgomery();
+        
+        a_val.partial_cmp(&b_val)
+    }
+}
+
 impl Fp {
     /// Creates a new field element
     pub fn new(value: BigUint, modulus: BigUint) -> Self {
@@ -112,7 +129,18 @@ impl Fp {
             to_limbs(&reduced_value, 4),
             cache.constants.clone(),
         );
-        mont_form.reduce();
+
+        // Convert to Montgomery form by multiplying by R^2 mod N
+        let r_squared_limbs = to_limbs(&cache.constants.r_squared, 4);
+        let modulus_limbs = to_limbs(&cache.constants.modulus, 4);
+        let n_prime_limbs = to_limbs(&cache.constants.n_prime, 4);
+        
+        mont_form.value = mont_mul(
+            &mont_form.value,
+            &r_squared_limbs,
+            &modulus_limbs,
+            &n_prime_limbs
+        );
 
         Self { mont_form }
     }
@@ -124,15 +152,20 @@ impl Fp {
         // Make sure the value is fully reduced before converting
         mont_form.reduce();
         
-        // Convert to BigUint safely
-        let mut bytes = Vec::with_capacity(mont_form.value.len() * 8);
-        for &limb in &mont_form.value {
-            for j in 0..8 {
-                bytes.push(((limb >> (j * 8)) & 0xFF) as u8);
-            }
-        }
+        // Convert from Montgomery form by multiplying by 1
+        let one_limbs = vec![1u64; 4];
+        let modulus_limbs = to_limbs(&mont_form.constants.modulus, 4);
+        let n_prime_limbs = to_limbs(&mont_form.constants.n_prime, 4);
         
-        BigUint::from_bytes_le(&bytes)
+        let result_limbs = mont_mul(
+            &mont_form.value,
+            &one_limbs,
+            &modulus_limbs,
+            &n_prime_limbs
+        );
+        
+        // Convert to BigUint safely
+        BigUint::from_bytes_le(&to_bytes(&result_limbs))
     }
 
     pub fn square(&mut self) -> Self {
@@ -145,6 +178,41 @@ impl Fp {
     /// Get the modulus of this field element
     pub fn modulus(&self) -> BigUint {
         self.mont_form.constants.modulus.clone()
+    }
+
+    fn inverse(&self) -> Option<Self> {
+        if self.is_zero() {
+            return None;
+        }
+
+        // Convert from Montgomery form
+        let mut a = self.mont_form.value.clone();
+        let modulus_limbs = to_limbs(&self.mont_form.constants.modulus, WORDS_PER_LIMB);
+        let one_limbs = vec![1u64; WORDS_PER_LIMB];
+        let n_prime_limbs = to_limbs(&self.mont_form.constants.n_prime, WORDS_PER_LIMB);
+
+        // Convert from Montgomery form
+        a = mont_mul(&a, &one_limbs, &modulus_limbs, &n_prime_limbs);
+
+        // Convert to BigUint for inverse calculation
+        let a_biguint = BigUint::from_bytes_le(&to_bytes(&a));
+        let modulus = self.mont_form.constants.modulus.clone();
+
+        // Implementation of modular inverse using extended Euclidean algorithm
+        let (g, mut x) = mod_inverse(&a_biguint, &modulus);
+        
+        // Check if gcd is 1 (meaning inverse exists)
+        if g != BigUint::one() {
+            return None;
+        }
+        
+        // Ensure x is reduced modulo the modulus
+        x = x % &modulus;
+
+        // Convert back to Montgomery form
+        let mut result = Self::new(x, modulus);
+        result.mont_form.reduce();
+        Some(result)
     }
 }
 
@@ -172,69 +240,36 @@ impl Field for Fp {
         let a_biguint = BigUint::from_bytes_le(&to_bytes(&a));
         let modulus = self.mont_form.constants.modulus.clone();
 
-        // Extended Binary GCD
-        let mut u = a_biguint;
-        let mut v = modulus.clone();
-        let mut b = BigUint::one();
-        let mut c = BigUint::zero();
-
-        while !u.is_zero() {
-            while u.is_even() {
-                u >>= 1;
-                if b.is_even() {
-                    b >>= 1;
-                } else {
-                    b = (b.clone() + modulus.clone()) >> 1;
-                }
-            }
-
-            while v.is_even() {
-                v >>= 1;
-                if c.is_even() {
-                    c >>= 1;
-                } else {
-                    c = (c.clone() + modulus.clone()) >> 1;
-                }
-            }
-
-            if u >= v {
-                u = u - v.clone();
-                if b >= c.clone() {
-                    b = b - c.clone();
-                } else {
-                    b = modulus.clone() - (c.clone() - b.clone());
-                }
-            } else {
-                v = v - u.clone();
-                if c.clone() >= b.clone() {
-                    c = c - b.clone();
-                } else {
-                    c = modulus.clone() - (b.clone() - c.clone());
-                }
-            }
-        }
-
-        if v != BigUint::one() {
+        // Implementation of modular inverse using extended Euclidean algorithm
+        let (g, mut x) = mod_inverse(&a_biguint, &modulus);
+        
+        // Check if gcd is 1 (meaning inverse exists)
+        if g != BigUint::one() {
             return None;
         }
+        
+        // Ensure x is reduced modulo the modulus
+        x = x % &modulus;
 
-        Some(Self::new(c, modulus))
+        // Convert back to Montgomery form
+        let mut result = Self::new(x, modulus);
+        result.mont_form.reduce();
+        Some(result)
     }
 
     fn pow(&self, exp: u64) -> Self {
+        let mut result = Self::one();
         let mut base = self.clone();
-        let mut result = Self::new(BigUint::one(), self.mont_form.constants.modulus.clone());
-        let mut e = exp;
+        let mut exp = exp;
 
-        while e > 0 {
-            if e & 1 == 1 {
-                let base_mont = base.mont_form.clone();
-                result.mont_form = result.mont_form.mul(&base_mont);
+        while exp > 0 {
+            if exp % 2 == 1 {
+                result = result * base.clone();
             }
-            let base_mont = base.mont_form.clone();
-            base.mont_form = base_mont.clone().mul(&base_mont);
-            e >>= 1;
+            base = base.square();
+            exp /= 2;
         }
+
         result
     }
 }
@@ -250,160 +285,128 @@ impl PrimeField for Fp {
     }
 
     fn from_montgomery(&self) -> Self {
-        // TODO: Implement conversion from Montgomery form
-        self.clone()
+        let value = self.from_montgomery();
+        let modulus = self.modulus();
+        Self::new(value, modulus)
     }
 }
 
 impl Add for Fp {
     type Output = Self;
 
-    #[inline(always)]
     fn add(mut self, other: Self) -> Self {
-        assert_eq!(self.mont_form.constants.modulus, other.mont_form.constants.modulus);
-        
-        // Use the built-in add method from MontgomeryForm
-        let result = self.mont_form.add(&other.mont_form);
-        
-        Self {
-            mont_form: result,
-        }
+        self.mont_form = self.mont_form.add(&other.mont_form);
+        self
     }
 }
 
 impl Sub for Fp {
     type Output = Self;
 
-    #[inline(always)]
     fn sub(mut self, other: Self) -> Self {
-        assert_eq!(self.mont_form.constants.modulus, other.mont_form.constants.modulus);
-        
-        // Use the built-in sub method from MontgomeryForm
-        let result = self.mont_form.sub(&other.mont_form);
-        
-        Self {
-            mont_form: result,
-        }
+        self.mont_form = self.mont_form.sub(&other.mont_form);
+        self
     }
 }
 
 impl Mul for Fp {
     type Output = Self;
 
-    #[inline(always)]
-    fn mul(self, other: Self) -> Self {
-        assert_eq!(self.mont_form.constants.modulus, other.mont_form.constants.modulus);
-        
-        let mut a = self.mont_form.clone();
-        let result = a.mul(&other.mont_form);
-        
-        Self {
-            mont_form: result,
-        }
+    fn mul(mut self, other: Self) -> Self {
+        self.mont_form = self.mont_form.mul(&other.mont_form);
+        self
     }
 }
 
 impl Zero for Fp {
     fn zero() -> Self {
-        // This is a very simplified implementation for demo purposes
-        // In a real implementation, we would need to ensure the modulus is correct
-        let modulus = BigUint::from(101u32); // Example small prime
+        let modulus = BigUint::from_str(
+            "21888242871839275222246405745257275088696311157297823662689037894645226208583"
+        ).unwrap();
         Self::new(BigUint::zero(), modulus)
     }
 
     fn is_zero(&self) -> bool {
-        let mut mont_form = self.mont_form.clone();
-        mont_form.reduce();
-        mont_form.value.iter().all(|&x| x == 0)
+        self.mont_form.value.iter().all(|&x| x == 0)
     }
 }
 
 impl One for Fp {
     fn one() -> Self {
-        // This is a very simplified implementation for demo purposes
-        // In a real implementation, we would need to ensure the modulus is correct
-        let modulus = BigUint::from(101u32); // Example small prime
+        let modulus = BigUint::from_str(
+            "21888242871839275222246405745257275088696311157297823662689037894645226208583"
+        ).unwrap();
         Self::new(BigUint::one(), modulus)
     }
 }
 
 impl Neg for Fp {
     type Output = Self;
-    
-    fn neg(self) -> Self {
-        if self.is_zero() {
-            return self;
-        }
-        
-        // Get the modulus and implement proper modular negation
-        let modulus = self.modulus();
-        
-        // Create a separate representation to avoid directly using from_montgomery
-        // which could lead to additional errors
-        let mut result_limbs = vec![0u64; WORDS_PER_LIMB];
-        let modulus_limbs = to_limbs(&modulus, WORDS_PER_LIMB);
-        let value_limbs = self.mont_form.value.clone();
-        
-        // If value is non-zero, compute modulus - value
-        if !value_limbs.iter().all(|&x| x == 0) {
-            let mut borrow = 0i64;
-            
-            // Subtract: modulus - value
-            for i in 0..WORDS_PER_LIMB {
-                let diff = (modulus_limbs[i] as i128) - (value_limbs[i] as i128) - (borrow as i128);
-                result_limbs[i] = diff as u64;
-                borrow = if diff < 0 { 1 } else { 0 };
-            }
-        }
-        
-        Self {
-            mont_form: MontgomeryForm::new(result_limbs, self.mont_form.constants.clone()),
-        }
+
+    fn neg(mut self) -> Self {
+        let mut zero = Self::zero();
+        self.mont_form = zero.mont_form.sub(&self.mont_form);
+        self
     }
 }
 
 impl Div for Fp {
     type Output = Self;
-    
+
     fn div(self, rhs: Self) -> Self {
-        match rhs.inverse() {
-            Some(inv) => self * inv,
-            None => panic!("Division by zero"),
-        }
+        let inv = rhs.inverse().expect("Division by zero");
+        self * inv
     }
 }
 
-/// Converts a BigUint to a fixed-size array of limbs
-#[inline(always)]
-fn to_limbs(value: &BigUint, num_limbs: usize) -> Vec<u64> {
-    let bytes = value.to_bytes_le();
-    let mut limbs = vec![0u64; num_limbs];
-    
-    // Convert bytes to limbs
-    for (i, chunk) in bytes.chunks(8).enumerate() {
-        if i >= num_limbs {
-            break;
-        }
+// Helper function for modular inverse using extended Euclidean algorithm for BigUint
+fn mod_inverse(a: &BigUint, m: &BigUint) -> (BigUint, BigUint) {
+    let mut s = BigUint::zero();
+    let mut old_s = BigUint::one();
+    let mut t = BigUint::one();
+    let mut old_t = BigUint::zero();
+    let mut r = m.clone();
+    let mut old_r = a.clone();
+
+    while !r.is_zero() {
+        let quotient = &old_r / &r;
         
-        let mut limb = 0u64;
-        for (j, &byte) in chunk.iter().enumerate() {
-            limb |= (byte as u64) << (j * 8);
-        }
-        limbs[i] = limb;
+        // Update old_r and r
+        let temp_r = r.clone();
+        r = modular_sub(&old_r, &(quotient.clone() * &r), m);
+        old_r = temp_r;
+        
+        // Update old_s and s
+        let temp_s = s.clone();
+        let qs = quotient.clone() * &s;
+        s = if old_s >= qs {
+            old_s.clone() - qs
+        } else {
+            m - (qs - old_s.clone()) % m
+        };
+        old_s = temp_s;
+        
+        // Update old_t and t
+        let temp_t = t.clone();
+        let qt = quotient * &t;
+        t = if old_t >= qt {
+            old_t.clone() - qt
+        } else {
+            m - (qt - old_t.clone()) % m
+        };
+        old_t = temp_t;
     }
-    
-    limbs
+
+    (old_r, old_s)
 }
 
-/// Converts a slice of u64 limbs to bytes in little-endian order
-fn to_bytes(limbs: &[u64]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(limbs.len() * 8);
-    for &limb in limbs {
-        for j in 0..8 {
-            bytes.push(((limb >> (j * 8)) & 0xFF) as u8);
-        }
+// Safe modular subtraction that handles the case where b > a
+fn modular_sub(a: &BigUint, b: &BigUint, m: &BigUint) -> BigUint {
+    if a >= b {
+        (a - b) % m
+    } else {
+        (m - (b - a) % m) % m
     }
-    bytes
 }
 
 #[cfg(test)]
@@ -412,48 +415,83 @@ mod tests {
     use std::str::FromStr;
     
     #[test]
-    fn test_field_arithmetic() {
-        // Test with a larger prime modulus to avoid underflow issues
-        let modulus = BigUint::from(101u32);
+    fn test_field_creation() {
+        // Use a small prime field for testing
+        let modulus = BigUint::from(17u32);
         
-        // Create field elements with values less than the modulus
-        let a = Fp::new(BigUint::from(30u32), modulus.clone());
-        let b = Fp::new(BigUint::from(50u32), modulus.clone());
+        // Create field elements
+        let a = Fp::new(BigUint::from(5u32), modulus.clone());
         
-        // Addition that doesn't exceed modulus
-        let sum = a.clone() + b.clone();
-        let expected_sum = Fp::new(BigUint::from(80u32), modulus.clone());
-        assert_eq!(sum.from_montgomery(), expected_sum.from_montgomery());
-        
-        // Subtraction that needs modular reduction
-        let diff = a.clone() - b.clone();
-        // 30 - 50 = -20, which in modular arithmetic is 101 - 20 = 81
-        let expected_diff = Fp::new(BigUint::from(81u32), modulus.clone());
-        assert_eq!(diff.from_montgomery(), expected_diff.from_montgomery());
-        
-        // Multiplication
-        let prod = a.clone() * b.clone();
-        // 30 * 50 = 1500, which is 1500 % 101 = 86
-        let expected_prod = Fp::new(BigUint::from(86u32), modulus.clone());
-        assert_eq!(prod.from_montgomery(), expected_prod.from_montgomery());
+        // Convert to standard form
+        assert_eq!(a.from_montgomery(), BigUint::from(5u32));
     }
     
     #[test]
-    fn test_montgomery_form() {
-        // Use a small prime for predictable results
-        let modulus = BigUint::from(101u32);
+    fn test_field_addition() {
+        // Use a small prime field for testing
+        let modulus = BigUint::from(17u32);
         
-        let a = Fp::new(BigUint::from(30u32), modulus.clone());
-        let b = Fp::new(BigUint::from(40u32), modulus.clone());
+        // Create field elements
+        let a = Fp::new(BigUint::from(5u32), modulus.clone());
+        let b = Fp::new(BigUint::from(7u32), modulus.clone());
         
-        // Basic operations
-        let c = a.clone() + b.clone();
-        let d = a.clone() * b.clone();
+        // Addition that doesn't exceed modulus
+        let sum = a.clone() + b.clone();
+        assert_eq!(sum.from_montgomery(), BigUint::from(12u32));
         
-        // 30 + 40 = 70
-        assert_eq!(c.from_montgomery() % &modulus, BigUint::from(70u32));
+        // Addition that exceeds modulus
+        let c = Fp::new(BigUint::from(10u32), modulus.clone());
+        let d = Fp::new(BigUint::from(9u32), modulus.clone());
+        let sum2 = c + d;
+        assert_eq!(sum2.from_montgomery(), BigUint::from(2u32)); // (10 + 9) mod 17 = 19 mod 17 = 2
+    }
+    
+    #[test]
+    fn test_field_subtraction() {
+        // Use a small prime field for testing
+        let modulus = BigUint::from(17u32);
         
-        // 30 * 40 = 1200, which is 1200 % 101 = 88
-        assert_eq!(d.from_montgomery() % &modulus, BigUint::from(88u32));
+        // Create field elements
+        let a = Fp::new(BigUint::from(12u32), modulus.clone());
+        let b = Fp::new(BigUint::from(7u32), modulus.clone());
+        
+        // Subtraction where a > b
+        let diff = a.clone() - b.clone();
+        assert_eq!(diff.from_montgomery(), BigUint::from(5u32));
+        
+        // Subtraction where a < b
+        let c = Fp::new(BigUint::from(5u32), modulus.clone());
+        let diff2 = c - b;
+        assert_eq!(diff2.from_montgomery(), BigUint::from(15u32)); // (5 - 7) mod 17 = -2 mod 17 = 15
+    }
+    
+    #[test]
+    fn test_field_multiplication() {
+        // Use a small prime field for testing
+        let modulus = BigUint::from(17u32);
+        
+        // Create field elements
+        let a = Fp::new(BigUint::from(5u32), modulus.clone());
+        let b = Fp::new(BigUint::from(7u32), modulus.clone());
+        
+        // Multiplication
+        let prod = a * b;
+        assert_eq!(prod.from_montgomery(), BigUint::from(1u32)); // (5 * 7) mod 17 = 35 mod 17 = 1
+    }
+    
+    #[test]
+    fn test_field_inverse() {
+        // Use a small prime field for testing
+        let modulus = BigUint::from(17u32);
+        
+        // Create field element
+        let a = Fp::new(BigUint::from(5u32), modulus.clone());
+        
+        // Compute inverse
+        let a_inv = a.inverse().unwrap();
+        
+        // Verify a * a^-1 = 1
+        let prod = a.clone() * a_inv;
+        assert_eq!(prod.from_montgomery(), BigUint::from(1u32));
     }
 } 
